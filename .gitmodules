@@ -1,0 +1,3 @@
+[submodule "external/phoenix-sdr-core"]
+	path = external/phoenix-sdr-core
+	url = https://github.com/Alex-Pennington/phoenix-sdr-core.git
