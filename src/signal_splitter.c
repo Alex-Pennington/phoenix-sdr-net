@@ -46,6 +46,7 @@ typedef SOCKET socket_t;
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -370,6 +371,16 @@ static bool set_nonblocking(socket_t sock) {
 #endif
 }
 
+static void set_nodelay(socket_t sock) {
+#ifdef _WIN32
+    BOOL opt = TRUE;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&opt, sizeof(opt));
+#else
+    int opt = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#endif
+}
+
 static bool tcp_recv_exact(socket_t sock, void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -546,6 +557,7 @@ static bool connect_to_sdr_control(void) {
     }
 
     set_nonblocking(g_sdr_ctrl_socket);
+    set_nodelay(g_sdr_ctrl_socket);
     fprintf(stderr, "[SDR-CTRL] Connected (text protocol)\n");
     g_sdr_ctrl_connected = true;
     return true;
@@ -564,6 +576,7 @@ static bool connect_to_relay_control(void) {
     }
 
     set_nonblocking(g_relay_ctrl_socket);
+    set_nodelay(g_relay_ctrl_socket);
     fprintf(stderr, "[RELAY-CTRL] Connected (bidirectional passthrough)\n");
     g_relay_ctrl_connected = true;
     return true;
