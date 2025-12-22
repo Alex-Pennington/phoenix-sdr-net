@@ -380,6 +380,15 @@ static bool tcp_recv_exact(socket_t sock, void *buf, size_t len) {
     return true;
 }
 
+/* Check if socket has data available (non-blocking) */
+static bool socket_has_data(socket_t sock) {
+    fd_set readfds;
+    struct timeval tv = {0, 0};  /* Don't wait */
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    return select((int)sock + 1, &readfds, NULL, NULL, &tv) > 0;
+}
+
 static bool tcp_send_exact(socket_t sock, const void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -902,8 +911,8 @@ static void run(void) {
         forward_relay_to_sdr();      /* Relay → SDR */
         forward_sdr_to_relay();      /* SDR → Relay */
 
-        /* Receive and process data from SDR */
-        if (g_sdr_connected) {
+        /* Receive and process data from SDR (non-blocking check) */
+        if (g_sdr_connected && socket_has_data(g_sdr_socket)) {
             iq_data_frame_t frame;
             if (!tcp_recv_exact(g_sdr_socket, &frame, sizeof(frame))) {
                 fprintf(stderr, "[SDR] Connection lost\n");
@@ -927,6 +936,9 @@ static void run(void) {
 
             /* Process samples */
             process_iq_samples(sample_buffer, frame.num_samples);
+        } else if (g_sdr_connected) {
+            /* No I/Q data yet, brief sleep to avoid busy loop */
+            Sleep(1);
         }
 
         /* Print status */
