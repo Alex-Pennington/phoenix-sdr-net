@@ -248,17 +248,6 @@ static float g_display_frame[RELAY_FRAME_SIZE * 2];
 static int g_detector_frame_idx = 0;
 static int g_display_frame_idx = 0;
 
-/* Discovery state */
-static bool g_discovery_enabled = true;
-static char g_node_id[64] = "SPLITTER-1";
-
-/* Service type constants */
-#define PN_SVC_SDR_SERVER       "sdr_server"
-#define PN_SVC_SIGNAL_SPLITTER  "signal_splitter"
-#define PN_SVC_WATERFALL        "waterfall"
-#define PN_SVC_CONTROLLER       "controller"
-#define PN_SVC_DETECTOR         "detector"
-
 /* Statistics */
 static uint64_t g_samples_received = 0;
 static uint64_t g_detector_samples_sent = 0;
@@ -267,34 +256,9 @@ static uint64_t g_detector_samples_dropped = 0;
 static uint64_t g_display_samples_dropped = 0;
 static time_t g_last_status_time = 0;
 
-/*============================================================================
- * Discovery Callback
- *============================================================================*/
-
-static void on_service_discovered(const char *id, const char *service,
-                                   const char *ip, int ctrl_port, int data_port,
-                                   const char *caps, bool is_bye, void *userdata) {
-    (void)userdata;
-    (void)caps;
-    (void)data_port;
-    
-    if (is_bye) {
-        fprintf(stderr, "[DISCOVERY] Service left: %s '%s'\n", service, id);
-        return;
-    }
-    
-    fprintf(stderr, "[DISCOVERY] Found %s '%s' at %s:%d\n", service, id, ip, ctrl_port);
-    
-    /* If we found an sdr_server and we're configured for localhost/auto, use it */
-    if (strcmp(service, PN_SVC_SDR_SERVER) == 0) {
-        if (strcmp(g_sdr_host, "localhost") == 0 || strcmp(g_sdr_host, "auto") == 0) {
-            fprintf(stderr, "[DISCOVERY] Auto-connecting to sdr_server at %s:%d\n", ip, data_port);
-            strncpy(g_sdr_host, ip, sizeof(g_sdr_host) - 1);
-            if (data_port > 0) g_sdr_port = data_port;
-            if (ctrl_port > 0) g_sdr_ctrl_port = ctrl_port;
-        }
-    }
-}
+/* Discovery */
+static bool g_discovery_enabled = true;
+static char g_node_id[64] = "SPLITTER-1";
 
 /*============================================================================
  * Signal Handler
@@ -305,6 +269,44 @@ static void signal_handler(int sig) {
     fprintf(stderr, "\n[SHUTDOWN] Received signal, shutting down gracefully...\n");
     g_shutdown_requested = true;
     g_running = false;
+}
+
+/*============================================================================
+ * Discovery Callback
+ *============================================================================*/
+
+static void on_service_discovered(const char *node_id, const char *service_type,
+                                   const char *address, int port, int data_port,
+                                   const char *capabilities, bool is_bye, void *userdata) {
+    (void)capabilities;
+    (void)userdata;
+    
+    /* Only interested in sdr_server */
+    if (strcmp(service_type, "sdr_server") != 0) {
+        return;
+    }
+    
+    /* Handle service leaving */
+    if (is_bye) {
+        fprintf(stderr, "[DISCOVERY] sdr_server %s leaving\n", node_id);
+        return;
+    }
+    
+    /* Skip if already connected to SDR */
+    if (g_sdr_connected) {
+        return;
+    }
+    
+    fprintf(stderr, "[DISCOVERY] Found sdr_server: %s @ %s:%d (data port %d)\n",
+            node_id, address, port, data_port);
+    
+    /* Auto-connect to discovered SDR server */
+    strncpy(g_sdr_host, address, sizeof(g_sdr_host) - 1);
+    g_sdr_host[sizeof(g_sdr_host) - 1] = '\0';
+    g_sdr_port = data_port;  /* Use data port for I/Q stream */
+    g_sdr_ctrl_port = port;  /* Control port */
+    
+    fprintf(stderr, "[DISCOVERY] Will connect to SDR @ %s:%d\n", g_sdr_host, g_sdr_port);
 }
 
 /*============================================================================
@@ -920,8 +922,8 @@ static void print_usage(const char *prog) {
     printf("  --relay-det PORT       Relay detector port (default: %d)\n", DEFAULT_RELAY_PORT_DET);
     printf("  --relay-disp PORT      Relay display port (default: %d)\n", DEFAULT_RELAY_PORT_DISP);
     printf("  --relay-ctrl PORT      Relay control port (default: %d)\n", DEFAULT_RELAY_CTRL_PORT);
-    printf("  --node-id ID           Node ID for discovery (default: SPLITTER-1)\n");
-    printf("  --no-discovery         Disable service discovery\n");
+    printf("  --node-id ID           Discovery node ID (default: SPLITTER-1)\n");
+    printf("  --no-discovery         Disable UDP discovery\n");
     printf("  -h, --help             Show this help\n\n");
     printf("Streams:\n");
     printf("  Input:  SDR server @ HOST:PORT (2 MHz I/Q, int16)\n");
@@ -985,6 +987,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize discovery */
+    if (g_discovery_enabled) {
+        if (pn_discovery_init(0) != 0) {
+            fprintf(stderr, "[DISCOVERY] Failed to initialize, continuing without discovery\n");
+            g_discovery_enabled = false;
+        } else {
+            pn_listen(on_service_discovered, NULL);
+            pn_announce(g_node_id, "signal_splitter", g_relay_det_port, g_relay_disp_port, "detector,display");
+            fprintf(stderr, "[DISCOVERY] Listening for sdr_server...\n");
+        }
+    }
+
     /* Initialize DSP (exact copy of waterfall.c initialization) */
     wf_lowpass_init(&g_detector_lowpass_i, FILTER_CUTOFF, (float)SDR_SAMPLE_RATE);
     wf_lowpass_init(&g_detector_lowpass_q, FILTER_CUTOFF, (float)SDR_SAMPLE_RATE);
@@ -999,19 +1013,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Initialize discovery */
-    if (g_discovery_enabled) {
-        if (pn_discovery_init(0) == 0) {
-            pn_listen(on_service_discovered, NULL);
-            pn_announce(g_node_id, PN_SVC_SIGNAL_SPLITTER, 
-                       g_relay_det_port, g_relay_disp_port, "modem,display");
-            fprintf(stderr, "[DISCOVERY] Announcing as %s\n", g_node_id);
-        } else {
-            fprintf(stderr, "[DISCOVERY] Failed to initialize, continuing without discovery\n");
-            g_discovery_enabled = false;
-        }
-    }
-
     fprintf(stderr, "[STARTUP] Ready to process signals\n\n");
     g_last_status_time = time(NULL);
 
@@ -1020,12 +1021,9 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     fprintf(stderr, "\n[SHUTDOWN] Closing connections...\n");
-    
-    /* Shutdown discovery */
     if (g_discovery_enabled) {
         pn_discovery_shutdown();
     }
-    
     disconnect_from_sdr();
     disconnect_from_relay();
     disconnect_from_control();

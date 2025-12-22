@@ -16,9 +16,9 @@ Network streaming and relay tools for the Phoenix Nest SDR system. Enables distr
 
 | Tool | Description |
 |------|-------------|
-| `sdr_server` | TCP control + I/Q streaming with Phoenix Nest discovery |
-| `signal_splitter` | Splits 2 MHz I/Q into detector (50k) + display (12k) with control passthrough |
-| `signal_relay` | Multi-client broadcast relay (runs on cloud server) |
+| `sdr_server` | TCP control server for SDRplay RSP2 Pro with I/Q streaming |
+| `signal_splitter` | Splits 2 MHz I/Q into detector (50 kHz) and display (12 kHz) paths |
+| `signal_relay` | Broadcast relay for multi-client distribution |
 | `wormhole` | MIL-STD-188-110A constellation display |
 | `test_iq_client.py` | Python test client for I/Q streaming |
 
@@ -72,22 +72,15 @@ Network streaming and relay tools for the Phoenix Nest SDR system. Enables distr
 
 ### sdr_server
 
-TCP control server for SDRplay RSP2 Pro hardware with Phoenix Nest service discovery.
+TCP control server for SDRplay RSP2 Pro hardware.
 
 **Ports:**
 - 4535: Control commands (text protocol)
 - 4536: I/Q streaming (binary protocol)
-- 5400: UDP service discovery broadcasts
-
-**Discovery:**
-- Automatically announces service on LAN
-- Default node ID: `SDR-SERVER-1`
-- Broadcasts every 30-60 seconds
-- Can be disabled with `--no-discovery`
 
 **Usage:**
 ```bash
-sdr_server.exe [-p control_port] [-i iq_port] [--node-id ID] [--no-discovery]
+sdr_server.exe [-p control_port] [-i iq_port] [-T telemetry_addr]
 ```
 
 **Protocol:**
@@ -98,27 +91,23 @@ sdr_server.exe [-p control_port] [-i iq_port] [--node-id ID] [--no-discovery]
 
 ### signal_splitter
 
-Splits high-rate I/Q stream into multiple lower-rate streams with bidirectional control passthrough.
+Splits high-rate I/Q stream into multiple lower-rate streams for different consumers.
 
 **Input:** 2 MHz I/Q from sdr_server:4536
 
 **Output:**
 - Port 4410: 50 kHz detector stream (float32 I/Q)
 - Port 4411: 12 kHz display stream (float32 I/Q)
-- Port 4409: Control passthrough (relay ↔ SDR server)
-
-**Default Relay:** 146.190.112.225 (configurable)
 
 **Usage:**
 ```bash
-signal_splitter.exe [--sdr-host localhost] [--relay-host IP] [--relay-det 4410] [--relay-disp 4411]
+signal_splitter.exe [--sdr host:port] [--relay host]
 ```
 
 **Processing:**
 - 5 kHz lowpass filter on both paths
 - 40:1 decimation for detector path
 - 166:1 decimation for display path
-- Automatic reconnection on network failures
 
 ---
 
@@ -126,23 +115,21 @@ signal_splitter.exe [--sdr-host localhost] [--relay-host IP] [--relay-det 4410] 
 
 Multi-client broadcast relay server. Accepts one producer connection and broadcasts to multiple consumers.
 
-**Deployment:** Cloud server (146.190.112.225)
+**Target Platform:** Linux (DigitalOcean droplet)
 
 **Ports:**
-- 4409: Control relay (bidirectional text protocol)
-- 4410: Detector stream relay (50 kHz float32)
-- 4411: Display stream relay (12 kHz float32)
+- 4410: Detector stream relay
+- 4411: Display stream relay
 
 **Features:**
 - Ring buffer per client (30 seconds)
 - Automatic slow client disconnection
 - Producer reconnection handling
 - Stream header forwarding to new clients
-- Control command passthrough
 
 **Usage:**
 ```bash
-./signal_relay
+./signal_relay [-d detector_port] [-p display_port]
 ```
 
 ---
@@ -237,23 +224,13 @@ struct {
 
 ## Building
 
-### Windows (CMake + MinGW)
+### Windows (sdr_server, signal_splitter, wormhole)
 
 ```powershell
-# Configure
-cmake --preset msys2-ucrt64
-
-# Build
-cmake --build --preset msys2-ucrt64
-
-# Deploy release
-.\deploy-release.ps1 -IncrementPatch -Deploy
+gcc -O2 -I include src/sdr_server.c -lws2_32 -o sdr_server.exe
+gcc -O2 -I include src/signal_splitter.c src/waterfall_dsp.c -lws2_32 -o signal_splitter.exe
+gcc -O2 -I include src/wormhole.c -lSDL2 -o wormhole.exe
 ```
-
-**Output:**
-- `build/msys2-ucrt64/sdr_server.exe`
-- `build/msys2-ucrt64/signal_splitter.exe`
-- `build/msys2-ucrt64/wormhole.exe`
 
 ### Linux (signal_relay)
 
@@ -269,7 +246,6 @@ gcc -O2 -I include src/signal_relay.c -lpthread -o signal_relay
 |------------|-------------|
 | [mars-suite](https://github.com/Alex-Pennington/mars-suite) | Phoenix Nest MARS Suite index |
 | [phoenix-sdr-core](https://github.com/Alex-Pennington/phoenix-sdr-core) | SDR hardware interface |
-| [phoenix-discovery](https://github.com/Alex-Pennington/phoenix-discovery) | Service discovery (UDP broadcast) |
 | [phoenix-waterfall](https://github.com/Alex-Pennington/phoenix-waterfall) | Waterfall display (client) |
 | [phoenix-wwv](https://github.com/Alex-Pennington/phoenix-wwv) | WWV detection library |
 
