@@ -121,6 +121,19 @@ else()
     target_link_libraries(signal_splitter PRIVATE pthread)
 endif()
 
+# SDR Controller - Send START/STOP commands to sdr_server (Windows + Linux)
+add_executable(sdr_controller src/sdr_controller.c)
+target_include_directories(sdr_controller PRIVATE 
+    ${PHOENIX_NET_INCLUDES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/include
+)
+target_link_libraries(sdr_controller PRIVATE pn_discovery)
+if(WIN32)
+    target_link_libraries(sdr_controller PRIVATE ws2_32 iphlpapi)
+else()
+    target_link_libraries(sdr_controller PRIVATE pthread)
+endif()
+
 # Wormhole - 3D constellation mapper (DISABLED for now)
 # add_executable(wormhole src/wormhole.c)
 # target_include_directories(wormhole PRIVATE ${PHOENIX_NET_INCLUDES})
@@ -141,7 +154,7 @@ endif()
 # Install
 #============================================================================
 
-set(INSTALL_TARGETS sdr_server signal_splitter)
+set(INSTALL_TARGETS sdr_server signal_splitter sdr_controller)
 if(NOT WIN32)
     list(APPEND INSTALL_TARGETS signal_relay)
 endif()
@@ -163,6 +176,7 @@ message(STATUS "")
 message(STATUS "Targets:")
 message(STATUS "  - sdr_server      (TCP control + I/Q streaming)")
 message(STATUS "  - signal_splitter (split to detector/display paths)")
+message(STATUS "  - sdr_controller  (send START/STOP commands)")
 if(NOT WIN32)
     message(STATUS "  - signal_relay    (Linux relay server)")
 endif()
