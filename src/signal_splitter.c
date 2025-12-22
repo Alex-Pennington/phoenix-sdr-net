@@ -222,6 +222,8 @@ static bool g_relay_det_connected = false;
 static bool g_relay_disp_connected = false;
 static uint32_t g_relay_det_sequence = 0;
 static uint32_t g_relay_disp_sequence = 0;
+static time_t g_last_display_header_time = 0;  /* For periodic header resend */
+static double g_test_pattern_phase = 0.0;       /* Test pattern phase accumulator */
 
 /* Control connections (text protocol passthrough) */
 static socket_t g_sdr_ctrl_socket = SOCKET_INVALID;
@@ -524,6 +526,63 @@ static bool connect_to_relay_display(void) {
     fprintf(stderr, "[RELAY-DISP] Connected: %u Hz float32 I/Q\n", DISPLAY_SAMPLE_RATE);
     g_relay_disp_connected = true;
     g_relay_disp_sequence = 0;
+    g_last_display_header_time = time(NULL);
+    return true;
+}
+
+/* Send header to display stream (for late-connecting clients) */
+static bool send_display_header(void) {
+    if (!g_relay_disp_connected) return false;
+    
+    relay_stream_header_t header = {
+        .magic = MAGIC_FT32,
+        .sample_rate = DISPLAY_SAMPLE_RATE,
+        .reserved1 = 0,
+        .reserved2 = 0
+    };
+    
+    if (!tcp_send_exact(g_relay_disp_socket, &header, sizeof(header))) {
+        return false;
+    }
+    
+    g_last_display_header_time = time(NULL);
+    return true;
+}
+
+/* Generate and send test pattern frame (1000 Hz tone at 12kHz sample rate) */
+static bool send_test_pattern_frame(void) {
+    if (!g_relay_disp_connected) return false;
+    
+    #define TEST_TONE_HZ 1000.0
+    #define TEST_SAMPLES 256
+    
+    float test_frame[TEST_SAMPLES * 2];  /* I/Q pairs */
+    double phase_inc = 2.0 * 3.14159265358979 * TEST_TONE_HZ / DISPLAY_SAMPLE_RATE;
+    
+    for (int i = 0; i < TEST_SAMPLES; i++) {
+        test_frame[i * 2]     = (float)cos(g_test_pattern_phase) * 0.5f;  /* I */
+        test_frame[i * 2 + 1] = (float)sin(g_test_pattern_phase) * 0.5f;  /* Q */
+        g_test_pattern_phase += phase_inc;
+        if (g_test_pattern_phase > 2.0 * 3.14159265358979) {
+            g_test_pattern_phase -= 2.0 * 3.14159265358979;
+        }
+    }
+    
+    relay_data_frame_t frame_hdr = {
+        .magic = MAGIC_DATA,
+        .sequence = g_relay_disp_sequence++,
+        .num_samples = TEST_SAMPLES,
+        .reserved = 0
+    };
+    
+    if (!tcp_send_exact(g_relay_disp_socket, &frame_hdr, sizeof(frame_hdr))) {
+        return false;
+    }
+    
+    if (!tcp_send_exact(g_relay_disp_socket, test_frame, sizeof(test_frame))) {
+        return false;
+    }
+    
     return true;
 }
 
@@ -914,9 +973,22 @@ static void run(void) {
             }
         }
 
-        /* If no SDR, just sleep and retry */
+        /* If no SDR, send test pattern to display clients */
         if (!g_sdr_connected) {
-            Sleep(1000);
+            time_t now = time(NULL);
+            
+            /* Resend header every 2 seconds for late-connecting clients */
+            if (g_relay_disp_connected && (now - g_last_display_header_time >= 2)) {
+                send_display_header();
+            }
+            
+            /* Send test pattern at ~12kHz / 256 = ~47 fps */
+            if (g_relay_disp_connected) {
+                send_test_pattern_frame();
+                Sleep(20);  /* ~50 fps */
+            } else {
+                Sleep(1000);  /* No client, just wait */
+            }
             continue;
         }
 
