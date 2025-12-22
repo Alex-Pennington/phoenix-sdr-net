@@ -5,6 +5,7 @@
  * Architecture:
  *   Listen on port 4410 (detector stream from signal_splitter)
  *   Listen on port 4411 (display stream from signal_splitter)
+ *   Listen on port 5401 (discovery coordinator - TCP registry)
  *   Broadcast received data to multiple clients on each port
  *
  * Client Management:
@@ -12,6 +13,12 @@
  *   - Drop slow clients that can't keep up
  *   - Continue broadcasting if splitter disconnects
  *   - Send stream header to new clients
+ *
+ * Discovery Coordinator (TCP):
+ *   - Edge nodes (signal_splitters) connect via TCP
+ *   - Register their services in central registry
+ *   - Query available services across all edge nodes
+ *   - Hub-and-spoke topology for NAT traversal
  *
  * Target Platform: Linux (DigitalOcean droplet)
  */
@@ -59,9 +66,43 @@ typedef struct {
 #define DETECTOR_PORT       4410
 #define DISPLAY_PORT        4411
 #define CONTROL_PORT        4409
+#define DISCOVERY_PORT      5401    /* TCP discovery coordinator */
 #define MAX_CLIENTS         100
+#define MAX_EDGE_NODES      32      /* Max signal_splitters connected */
+#define MAX_SERVICES        128     /* Total services across all edges */
 #define CLIENT_BUFFER_SIZE  (50000 * 30)  /* 30 sec @ 50kHz (worst case) */
 #define STATUS_INTERVAL_SEC 5
+#define EDGE_TIMEOUT_SEC    120     /* Remove edge if no heartbeat */
+
+/*============================================================================
+ * Discovery Protocol (JSON over TCP, newline-delimited)
+ *============================================================================*/
+
+/* Message types matching pn_discovery.h */
+#define DISC_CMD_HELO   "helo"      /* Edge node announces service */
+#define DISC_CMD_BYE    "bye"       /* Edge node removes service */
+#define DISC_CMD_LIST   "list"      /* Query all services */
+#define DISC_CMD_FIND   "find"      /* Find specific service type */
+
+/* Edge node tracking */
+typedef struct {
+    int fd;                         /* TCP socket */
+    char ip[64];                    /* Edge node's public IP */
+    time_t last_seen;               /* Last message timestamp */
+    int service_count;              /* Number of services registered */
+} edge_node_t;
+
+/* Service registry entry */
+typedef struct {
+    char id[64];                    /* e.g., "KY4OLB-SDR1" */
+    char service[32];               /* e.g., "sdr_server" */
+    char ip[64];                    /* Edge node's IP */
+    int ctrl_port;
+    int data_port;
+    char caps[128];                 /* Capabilities */
+    int edge_idx;                   /* Which edge_node owns this */
+    time_t registered;
+} service_entry_t;
 
 /*============================================================================
  * Client Ring Buffer
@@ -266,15 +307,21 @@ static volatile bool g_running = true;
 static int g_detector_listen_fd = -1;
 static int g_display_listen_fd = -1;
 static int g_control_listen_fd = -1;
+static int g_discovery_listen_fd = -1;
 static int g_detector_source_fd = -1;
 static int g_display_source_fd = -1;
 static int g_control_source_fd = -1;  /* signal_splitter connection */
 static int g_control_client_fd = -1;  /* remote client connection */
 static client_list_t g_detector_clients;
 static client_list_t g_display_clients;
-static client_list_t g_display_clients;
 static time_t g_start_time;
 static time_t g_last_status_time;
+
+/* Discovery coordinator state */
+static edge_node_t g_edge_nodes[MAX_EDGE_NODES];
+static int g_edge_count = 0;
+static service_entry_t g_services[MAX_SERVICES];
+static int g_service_count = 0;
 
 /*============================================================================
  * Signal Handler
@@ -428,6 +475,273 @@ static void forward_control_data(int from_fd, int to_fd, const char *label) {
 }
 
 /*============================================================================
+ * Discovery Coordinator (TCP Registry)
+ *============================================================================*/
+
+/* Simple JSON value extractor - finds "key":"value" and returns value */
+static int json_get_string(const char *json, const char *key, char *out, size_t out_size) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    const char *end = strchr(start, '"');
+    if (!end) return -1;
+    
+    size_t len = end - start;
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int json_get_int(const char *json, const char *key) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    return atoi(start);
+}
+
+/* Find edge node by fd */
+static int find_edge_by_fd(int fd) {
+    for (int i = 0; i < g_edge_count; i++) {
+        if (g_edge_nodes[i].fd == fd) return i;
+    }
+    return -1;
+}
+
+/* Add or update edge node */
+static int add_edge_node(int fd, const char *ip) {
+    int idx = find_edge_by_fd(fd);
+    if (idx >= 0) {
+        g_edge_nodes[idx].last_seen = time(NULL);
+        return idx;
+    }
+    
+    if (g_edge_count >= MAX_EDGE_NODES) {
+        fprintf(stderr, "[DISCOVERY] Max edge nodes reached, rejecting\n");
+        return -1;
+    }
+    
+    edge_node_t *edge = &g_edge_nodes[g_edge_count];
+    edge->fd = fd;
+    strncpy(edge->ip, ip, sizeof(edge->ip) - 1);
+    edge->last_seen = time(NULL);
+    edge->service_count = 0;
+    
+    fprintf(stderr, "[DISCOVERY] Edge node connected: %s (idx=%d)\n", ip, g_edge_count);
+    return g_edge_count++;
+}
+
+/* Remove edge node and its services */
+static void remove_edge_node(int idx) {
+    if (idx < 0 || idx >= g_edge_count) return;
+    
+    edge_node_t *edge = &g_edge_nodes[idx];
+    fprintf(stderr, "[DISCOVERY] Edge node disconnected: %s\n", edge->ip);
+    
+    /* Remove all services from this edge */
+    for (int i = g_service_count - 1; i >= 0; i--) {
+        if (g_services[i].edge_idx == idx) {
+            fprintf(stderr, "[DISCOVERY] Removing service: %s/%s\n", 
+                    g_services[i].service, g_services[i].id);
+            /* Shift remaining services */
+            for (int j = i; j < g_service_count - 1; j++) {
+                g_services[j] = g_services[j + 1];
+            }
+            g_service_count--;
+        }
+    }
+    
+    /* Update edge_idx for services from higher-indexed edges */
+    for (int i = 0; i < g_service_count; i++) {
+        if (g_services[i].edge_idx > idx) {
+            g_services[i].edge_idx--;
+        }
+    }
+    
+    close(edge->fd);
+    
+    /* Shift remaining edges */
+    for (int i = idx; i < g_edge_count - 1; i++) {
+        g_edge_nodes[i] = g_edge_nodes[i + 1];
+    }
+    g_edge_count--;
+}
+
+/* Register a service from an edge node */
+static int register_service(int edge_idx, const char *id, const char *service,
+                            int ctrl_port, int data_port, const char *caps) {
+    /* Check if service already exists (update it) */
+    for (int i = 0; i < g_service_count; i++) {
+        if (strcmp(g_services[i].id, id) == 0 && 
+            strcmp(g_services[i].service, service) == 0) {
+            /* Update existing */
+            g_services[i].ctrl_port = ctrl_port;
+            g_services[i].data_port = data_port;
+            strncpy(g_services[i].caps, caps, sizeof(g_services[i].caps) - 1);
+            g_services[i].registered = time(NULL);
+            return i;
+        }
+    }
+    
+    if (g_service_count >= MAX_SERVICES) {
+        fprintf(stderr, "[DISCOVERY] Max services reached\n");
+        return -1;
+    }
+    
+    service_entry_t *svc = &g_services[g_service_count];
+    strncpy(svc->id, id, sizeof(svc->id) - 1);
+    strncpy(svc->service, service, sizeof(svc->service) - 1);
+    strncpy(svc->ip, g_edge_nodes[edge_idx].ip, sizeof(svc->ip) - 1);
+    svc->ctrl_port = ctrl_port;
+    svc->data_port = data_port;
+    strncpy(svc->caps, caps, sizeof(svc->caps) - 1);
+    svc->edge_idx = edge_idx;
+    svc->registered = time(NULL);
+    
+    g_edge_nodes[edge_idx].service_count++;
+    
+    fprintf(stderr, "[DISCOVERY] Registered: %s/%s at %s:%d/%d caps=%s\n",
+            service, id, svc->ip, ctrl_port, data_port, caps);
+    
+    return g_service_count++;
+}
+
+/* Unregister a service */
+static void unregister_service(const char *id, const char *service) {
+    for (int i = 0; i < g_service_count; i++) {
+        if (strcmp(g_services[i].id, id) == 0 &&
+            (service == NULL || strcmp(g_services[i].service, service) == 0)) {
+            
+            fprintf(stderr, "[DISCOVERY] Unregistered: %s/%s\n", 
+                    g_services[i].service, g_services[i].id);
+            
+            int edge_idx = g_services[i].edge_idx;
+            if (edge_idx >= 0 && edge_idx < g_edge_count) {
+                g_edge_nodes[edge_idx].service_count--;
+            }
+            
+            /* Shift remaining */
+            for (int j = i; j < g_service_count - 1; j++) {
+                g_services[j] = g_services[j + 1];
+            }
+            g_service_count--;
+            return;
+        }
+    }
+}
+
+/* Build JSON response listing services */
+static int build_service_list(char *buf, size_t buf_size, const char *filter_service) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buf_size - pos, 
+                    "{\"m\":\"PNSD\",\"v\":1,\"cmd\":\"list\",\"services\":[");
+    
+    bool first = true;
+    for (int i = 0; i < g_service_count; i++) {
+        if (filter_service && strcmp(g_services[i].service, filter_service) != 0) {
+            continue;
+        }
+        
+        if (!first) pos += snprintf(buf + pos, buf_size - pos, ",");
+        first = false;
+        
+        pos += snprintf(buf + pos, buf_size - pos,
+                        "{\"id\":\"%s\",\"svc\":\"%s\",\"ip\":\"%s\","
+                        "\"port\":%d,\"data\":%d,\"caps\":\"%s\"}",
+                        g_services[i].id, g_services[i].service, g_services[i].ip,
+                        g_services[i].ctrl_port, g_services[i].data_port,
+                        g_services[i].caps);
+    }
+    
+    pos += snprintf(buf + pos, buf_size - pos, "]}\n");
+    return pos;
+}
+
+/* Process discovery message from edge node */
+static void process_discovery_message(int edge_idx, const char *msg) {
+    char cmd[32] = {0};
+    char id[64] = {0};
+    char svc[32] = {0};
+    char caps[128] = {0};
+    
+    json_get_string(msg, "cmd", cmd, sizeof(cmd));
+    
+    if (strcmp(cmd, DISC_CMD_HELO) == 0) {
+        json_get_string(msg, "id", id, sizeof(id));
+        json_get_string(msg, "svc", svc, sizeof(svc));
+        json_get_string(msg, "caps", caps, sizeof(caps));
+        int port = json_get_int(msg, "port");
+        int data = json_get_int(msg, "data");
+        
+        register_service(edge_idx, id, svc, port, data, caps);
+        g_edge_nodes[edge_idx].last_seen = time(NULL);
+        
+    } else if (strcmp(cmd, DISC_CMD_BYE) == 0) {
+        json_get_string(msg, "id", id, sizeof(id));
+        json_get_string(msg, "svc", svc, sizeof(svc));
+        
+        unregister_service(id, svc[0] ? svc : NULL);
+        
+    } else if (strcmp(cmd, DISC_CMD_LIST) == 0 || strcmp(cmd, DISC_CMD_FIND) == 0) {
+        char filter[32] = {0};
+        if (strcmp(cmd, DISC_CMD_FIND) == 0) {
+            json_get_string(msg, "svc", filter, sizeof(filter));
+        }
+        
+        char response[4096];
+        int len = build_service_list(response, sizeof(response), 
+                                     filter[0] ? filter : NULL);
+        
+        send(g_edge_nodes[edge_idx].fd, response, len, MSG_NOSIGNAL);
+    }
+}
+
+/* Handle incoming data from edge node */
+static void handle_edge_data(int edge_idx) {
+    char buffer[4096];
+    edge_node_t *edge = &g_edge_nodes[edge_idx];
+    
+    ssize_t received = recv(edge->fd, buffer, sizeof(buffer) - 1, 0);
+    
+    if (received <= 0) {
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        remove_edge_node(edge_idx);
+        return;
+    }
+    
+    buffer[received] = '\0';
+    
+    /* Process each line (newline-delimited JSON) */
+    char *line = strtok(buffer, "\n");
+    while (line) {
+        if (line[0] == '{') {
+            process_discovery_message(edge_idx, line);
+        }
+        line = strtok(NULL, "\n");
+    }
+}
+
+/* Check for timed-out edge nodes */
+static void check_edge_timeouts(void) {
+    time_t now = time(NULL);
+    
+    for (int i = g_edge_count - 1; i >= 0; i--) {
+        if (now - g_edge_nodes[i].last_seen > EDGE_TIMEOUT_SEC) {
+            fprintf(stderr, "[DISCOVERY] Edge timeout: %s\n", g_edge_nodes[i].ip);
+            remove_edge_node(i);
+        }
+    }
+}
+
+/*============================================================================
  * Status Reporting
  *============================================================================*/
 
@@ -461,6 +775,12 @@ static void print_status(void) {
     fprintf(stderr, "[STATUS] Control: source=%s client=%s\n",
             g_control_source_fd >= 0 ? "UP" : "DOWN",
             g_control_client_fd >= 0 ? "CONNECTED" : "---");
+
+    fprintf(stderr, "[STATUS] Discovery: edges=%d services=%d\n",
+            g_edge_count, g_service_count);
+    
+    /* Check for edge timeouts */
+    check_edge_timeouts();
 }
 
 /*============================================================================
@@ -479,9 +799,11 @@ static void run(void) {
         FD_SET(g_detector_listen_fd, &readfds);
         FD_SET(g_display_listen_fd, &readfds);
         FD_SET(g_control_listen_fd, &readfds);
+        FD_SET(g_discovery_listen_fd, &readfds);
         max_fd = g_detector_listen_fd;
         if (g_display_listen_fd > max_fd) max_fd = g_display_listen_fd;
         if (g_control_listen_fd > max_fd) max_fd = g_control_listen_fd;
+        if (g_discovery_listen_fd > max_fd) max_fd = g_discovery_listen_fd;
 
         /* Source sockets */
         if (g_detector_source_fd >= 0) {
@@ -499,6 +821,12 @@ static void run(void) {
         if (g_control_client_fd >= 0) {
             FD_SET(g_control_client_fd, &readfds);
             if (g_control_client_fd > max_fd) max_fd = g_control_client_fd;
+        }
+        
+        /* Edge node sockets */
+        for (int i = 0; i < g_edge_count; i++) {
+            FD_SET(g_edge_nodes[i].fd, &readfds);
+            if (g_edge_nodes[i].fd > max_fd) max_fd = g_edge_nodes[i].fd;
         }
 
         /* Select with 100ms timeout */
@@ -548,6 +876,31 @@ static void run(void) {
             }
         }
 
+        /* Accept discovery connections (edge nodes) */
+        if (FD_ISSET(g_discovery_listen_fd, &readfds)) {
+            struct sockaddr_in addr;
+            socklen_t addr_len = sizeof(addr);
+            int fd = accept(g_discovery_listen_fd, (struct sockaddr*)&addr, &addr_len);
+
+            if (fd >= 0) {
+                set_nonblocking(fd);
+                char ip_str[64];
+                strncpy(ip_str, inet_ntoa(addr.sin_addr), sizeof(ip_str) - 1);
+                
+                int edge_idx = add_edge_node(fd, ip_str);
+                if (edge_idx < 0) {
+                    close(fd);
+                }
+            }
+        }
+        
+        /* Handle data from edge nodes */
+        for (int i = g_edge_count - 1; i >= 0; i--) {
+            if (FD_ISSET(g_edge_nodes[i].fd, &readfds)) {
+                handle_edge_data(i);
+            }
+        }
+
         /* Receive from sources and relay */
         if (g_detector_source_fd >= 0 && FD_ISSET(g_detector_source_fd, &readfds)) {
             if (!receive_and_relay(g_detector_source_fd, &g_detector_clients, "DETECTOR")) {
@@ -566,13 +919,11 @@ static void run(void) {
         if (g_control_source_fd >= 0 && g_control_client_fd >= 0) {
             /* Client → Source (commands from remote user to SDR) */
             if (FD_ISSET(g_control_client_fd, &readfds)) {
-                forward_control_data(g_control_client_fd, g_control_source_fd,
-                                     &g_control_client_fd, "CLIENT→SOURCE");
+                forward_control_data(g_control_client_fd, g_control_source_fd, "CLIENT->SOURCE");
             }
             /* Source → Client (responses from SDR to remote user) */
             if (FD_ISSET(g_control_source_fd, &readfds)) {
-                forward_control_data(g_control_source_fd, g_control_client_fd,
-                                     &g_control_source_fd, "SOURCE→CLIENT");
+                forward_control_data(g_control_source_fd, g_control_client_fd, "SOURCE->CLIENT");
             }
         }
 
@@ -594,9 +945,10 @@ int main(int argc, char *argv[]) {
     (void)argv;
 
     printf("Phoenix SDR Signal Relay\n");
-    printf("Detector stream: port %d (50 kHz float32 I/Q)\n", DETECTOR_PORT);
-    printf("Display stream:  port %d (12 kHz float32 I/Q)\n", DISPLAY_PORT);
-    printf("Control relay:   port %d (text commands)\n\n", CONTROL_PORT);
+    printf("Detector stream:  port %d (50 kHz float32 I/Q)\n", DETECTOR_PORT);
+    printf("Display stream:   port %d (12 kHz float32 I/Q)\n", DISPLAY_PORT);
+    printf("Control relay:    port %d (text commands)\n", CONTROL_PORT);
+    printf("Discovery coord:  port %d (TCP service registry)\n\n", DISCOVERY_PORT);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -610,8 +962,10 @@ int main(int argc, char *argv[]) {
     g_detector_listen_fd = create_listen_socket(DETECTOR_PORT);
     g_display_listen_fd = create_listen_socket(DISPLAY_PORT);
     g_control_listen_fd = create_listen_socket(CONTROL_PORT);
+    g_discovery_listen_fd = create_listen_socket(DISCOVERY_PORT);
 
-    if (g_detector_listen_fd < 0 || g_display_listen_fd < 0 || g_control_listen_fd < 0) {
+    if (g_detector_listen_fd < 0 || g_display_listen_fd < 0 || 
+        g_control_listen_fd < 0 || g_discovery_listen_fd < 0) {
         fprintf(stderr, "Failed to create listen sockets\n");
         return 1;
     }
@@ -619,6 +973,7 @@ int main(int argc, char *argv[]) {
     set_nonblocking(g_detector_listen_fd);
     set_nonblocking(g_display_listen_fd);
     set_nonblocking(g_control_listen_fd);
+    set_nonblocking(g_discovery_listen_fd);
 
     g_start_time = time(NULL);
     g_last_status_time = g_start_time;
@@ -636,9 +991,15 @@ int main(int argc, char *argv[]) {
     if (g_control_source_fd >= 0) close(g_control_source_fd);
     if (g_control_client_fd >= 0) close(g_control_client_fd);
 
+    /* Close edge nodes */
+    for (int i = 0; i < g_edge_count; i++) {
+        close(g_edge_nodes[i].fd);
+    }
+
     close(g_detector_listen_fd);
     close(g_display_listen_fd);
     close(g_control_listen_fd);
+    close(g_discovery_listen_fd);
 
     for (int i = 0; i < g_detector_clients.count; i++) {
         close(g_detector_clients.clients[i].fd);
