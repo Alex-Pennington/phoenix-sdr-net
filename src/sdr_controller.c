@@ -50,7 +50,7 @@ typedef int socklen_t;
 #define DEFAULT_FREQ_HZ     15000000    /* 15 MHz (WWV) */
 #define DEFAULT_GAIN        40
 #define MAX_LINE            256
-#define DISCOVERY_WAIT_SEC  5
+#define DISCOVERY_WAIT_SEC  300  /* 5 minutes - keep waiting */
 
 /*============================================================================
  * Globals
@@ -293,6 +293,9 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
+        /* Announce ourselves so other services know to re-announce */
+        pn_announce("CONTROLLER-1", PN_SVC_CONTROLLER, 0, 0, NULL);
+        
         /* Start listening */
         if (pn_listen(on_service_discovered, NULL) != 0) {
             fprintf(stderr, "Failed to start discovery listener\n");
@@ -301,15 +304,19 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        /* Wait for service */
-        printf("Waiting for sdr_server or signal_splitter...\n");
-        for (int i = 0; i < DISCOVERY_WAIT_SEC * 10 && !g_service_found && g_running; i++) {
+        /* Wait for service - keep waiting until found or Ctrl+C */
+        printf("Waiting for sdr_server or signal_splitter... (Ctrl+C to quit)\n");
+        int wait_count = 0;
+        while (!g_service_found && g_running) {
             sleep_ms(100);
+            wait_count++;
+            if (wait_count % 100 == 0) {  /* Every 10 seconds */
+                printf("  Still waiting... (%d sec)\n", wait_count / 10);
+            }
         }
         
         if (!g_service_found) {
-            fprintf(stderr, "No sdr_server found within %d seconds\n", DISCOVERY_WAIT_SEC);
-            fprintf(stderr, "Use -H <ip> for direct connection\n");
+            printf("Discovery cancelled.\n");
             pn_discovery_shutdown();
             socket_cleanup();
             return 1;
