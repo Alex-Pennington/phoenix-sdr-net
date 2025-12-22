@@ -868,36 +868,34 @@ static void run(void) {
     while (g_running) {
         time_t now = time(NULL);
 
-        /* Try to connect/reconnect */
+        /* Try to connect/reconnect to SDR */
         if (!g_sdr_connected && (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
-            if (connect_to_sdr()) {
-                last_reconnect = now;
-            } else {
-                last_reconnect = now;
-                Sleep(1000);
-                continue;
-            }
-        }
-
-        /* Connect control paths */
-        if (!g_sdr_ctrl_connected && g_sdr_connected &&
-            (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
-            connect_to_sdr_control();
+            connect_to_sdr();
             last_reconnect = now;
         }
 
-        /* Connect to relay (all ports are fixed) */
-        if (strlen(g_relay_host) > 0 && (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
+        /* Connect control paths */
+        if (!g_sdr_ctrl_connected && g_sdr_connected) {
+            connect_to_sdr_control();
+        }
+
+        /* Connect to relay (no delay - try immediately) */
+        if (strlen(g_relay_host) > 0) {
             if (!g_relay_ctrl_connected) {
                 connect_to_relay_control();
-                last_reconnect = now;
-            } else if (!g_relay_det_connected) {
-                connect_to_relay_detector();
-                last_reconnect = now;
-            } else if (!g_relay_disp_connected) {
-                connect_to_relay_display();
-                last_reconnect = now;
             }
+            if (!g_relay_det_connected) {
+                connect_to_relay_detector();
+            }
+            if (!g_relay_disp_connected) {
+                connect_to_relay_display();
+            }
+        }
+
+        /* If no SDR, just sleep and retry */
+        if (!g_sdr_connected) {
+            Sleep(1000);
+            continue;
         }
 
         /* Process control channel */
