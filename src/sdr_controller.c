@@ -162,9 +162,8 @@ static void on_service_discovered(const char *id, const char *service,
     
     printf("[Discovery] Found: %s (%s) at %s:%d\n", id, service, ip, ctrl_port);
     
-    /* Look for sdr_server or signal_splitter */
-    if (strcmp(service, PN_SVC_SDR_SERVER) == 0 || 
-        strcmp(service, PN_SVC_SIGNAL_SPLITTER) == 0) {
+    /* Look for sdr_server only (not signal_splitter - that's a data forwarder, not control) */
+    if (strcmp(service, PN_SVC_SDR_SERVER) == 0) {
         memset(&g_found_service, 0, sizeof(g_found_service));
         strncpy(g_found_service.id, id, sizeof(g_found_service.id) - 1);
         strncpy(g_found_service.service, service, sizeof(g_found_service.service) - 1);
@@ -305,7 +304,7 @@ int main(int argc, char *argv[]) {
         }
         
         /* Wait for service - keep waiting until found or Ctrl+C */
-        printf("Waiting for sdr_server or signal_splitter... (Ctrl+C to quit)\n");
+        printf("Waiting for sdr_server... (Ctrl+C to quit)\n");
         int wait_count = 0;
         while (!g_service_found && g_running) {
             sleep_ms(100);
