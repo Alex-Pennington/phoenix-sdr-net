@@ -40,6 +40,7 @@ typedef int socklen_t;
 #include "tcp_server.h"
 #include "phoenix_sdr.h"
 #include "version.h"
+#include "pn_discovery.h"
 #include <stdarg.h>
 
 /*============================================================================
@@ -106,6 +107,10 @@ static bool g_start_minimized = false;
 static SOCKET g_listen_socket = INVALID_SOCKET;
 static SOCKET g_client_socket = INVALID_SOCKET;
 static tcp_sdr_state_t g_sdr_state;
+
+/* Discovery state */
+static bool g_discovery_enabled = true;
+static char g_node_id[64] = "SDR-SERVER-1";
 
 /* I/Q streaming globals */
 static SOCKET g_iq_listen_socket = INVALID_SOCKET;
@@ -728,6 +733,11 @@ static void signal_handler(int sig) {
     printf("\nShutting down...\n");
     g_running = false;
 
+    /* Shutdown discovery */
+    if (g_discovery_enabled) {
+        pn_discovery_shutdown();
+    }
+
     /* Send DISCONNECT notification to client before closing */
     if (g_client_socket != INVALID_SOCKET) {
         const char *disconnect_msg = "! DISCONNECT server shutdown\n";
@@ -946,6 +956,8 @@ static void print_usage(const char *prog) {
     printf("  -d INDEX   Select SDR device index (default: 0)\n");
     printf("  -l         Log output to file (sdr_server_<version>.log)\n");
     printf("  -m         Start minimized (or hidden if -l also set)\n");
+    printf("  --node-id ID      Node ID for discovery (default: SDR-SERVER-1)\n");
+    printf("  --no-discovery    Disable service discovery\n");
     printf("  -h         Show this help\n");
     printf("\nProtocol: See docs/SDR_TCP_CONTROL_INTERFACE.md\n");
     printf("I/Q Stream: See docs/SDR_IQ_STREAMING_INTERFACE.md\n");
@@ -1102,6 +1114,10 @@ int main(int argc, char *argv[]) {
             g_log_to_file = true;
         } else if (strcmp(argv[i], "-m") == 0) {
             g_start_minimized = true;
+        } else if (strcmp(argv[i], "--node-id") == 0 && i + 1 < argc) {
+            strncpy(g_node_id, argv[++i], sizeof(g_node_id) - 1);
+        } else if (strcmp(argv[i], "--no-discovery") == 0) {
+            g_discovery_enabled = false;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1290,6 +1306,20 @@ int main(int argc, char *argv[]) {
 
     printf("Hardware: %s\n", g_sdr_state.hardware_connected ? "CONNECTED" : "NOT CONNECTED");
 
+    /* Initialize discovery and announce ourselves */
+    if (g_discovery_enabled) {
+        if (pn_discovery_init(0) == 0) {
+            /* Announce as sdr_server with control and data ports */
+            pn_announce(g_node_id, "sdr_server", port, iq_port, "sdrplay,2mhz");
+            printf("Discovery: ENABLED (announcing as %s)\n", g_node_id);
+        } else {
+            fprintf(stderr, "Warning: Discovery init failed, continuing without discovery\n");
+            g_discovery_enabled = false;
+        }
+    } else {
+        printf("Discovery: DISABLED\n");
+    }
+
     printf("Press Ctrl+C to stop\n\n");
 
     /* Accept loop */
@@ -1349,6 +1379,12 @@ int main(int argc, char *argv[]) {
         cleanup_tray_icon();
     }
 #endif
+
+    /* Shutdown discovery */
+    if (g_discovery_enabled) {
+        pn_discovery_shutdown();
+    }
+
     cleanup_sdr(&g_sdr_state);
     tcp_notify_cleanup(&g_sdr_state);
     iq_buffer_cleanup();

@@ -84,10 +84,13 @@ set(PHOENIX_NET_INCLUDES
 
 # SDR Server - TCP control + I/Q streaming (Windows + Linux)
 add_executable(sdr_server src/sdr_server.c)
-target_link_libraries(sdr_server PRIVATE phoenix_sdr_core)
-target_include_directories(sdr_server PRIVATE ${PHOENIX_NET_INCLUDES})
+target_link_libraries(sdr_server PRIVATE phoenix_sdr_core pn_discovery)
+target_include_directories(sdr_server PRIVATE 
+    ${PHOENIX_NET_INCLUDES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/include
+)
 if(WIN32)
-    target_link_libraries(sdr_server PRIVATE ws2_32 shell32)
+    target_link_libraries(sdr_server PRIVATE ws2_32 shell32 iphlpapi)
     
     # Copy SDRplay DLL to output directory
     if(SDRplayAPI_DLL)
