@@ -1094,7 +1094,7 @@ int main(int argc, char *argv[]) {
 
     int port = TCP_DEFAULT_PORT;
     int iq_port = IQ_DEFAULT_PORT;
-    const char *bind_addr = "127.0.0.1";
+    const char *bind_addr = "0.0.0.0";  /* Listen on all interfaces by default */
     bool iq_enabled = true;
     int device_idx = 0;
 
