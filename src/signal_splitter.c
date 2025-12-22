@@ -128,7 +128,11 @@ typedef struct {
 #define DEFAULT_SDR_CTRL_PORT   4535
 #define DEFAULT_RELAY_PORT_DET  4410
 #define DEFAULT_RELAY_PORT_DISP 4411
-#define DEFAULT_RELAY_CTRL_PORT 4409
+#define DEFAULT_RELAY_RENDEZVOUS 3000       /* Initial handshake port */
+
+/* Control channel message types */
+#define MSG_TYPE_RELAY  'r'     /* Relay command */
+#define MSG_TYPE_SDR    's'     /* SDR passthrough */
 
 /*============================================================================
  * Ring Buffer
@@ -226,9 +230,11 @@ static uint32_t g_relay_disp_sequence = 0;
 static socket_t g_sdr_ctrl_socket = SOCKET_INVALID;
 static socket_t g_relay_ctrl_socket = SOCKET_INVALID;
 static int g_sdr_ctrl_port = DEFAULT_SDR_CTRL_PORT;
-static int g_relay_ctrl_port = DEFAULT_RELAY_CTRL_PORT;
+static int g_relay_ctrl_port = 0;           /* Assigned by relay during handshake */
 static bool g_sdr_ctrl_connected = false;
 static bool g_relay_ctrl_connected = false;
+static char g_ctrl_recv_buf[8192];          /* Buffer for partial JSON messages */
+static int g_ctrl_recv_len = 0;
 
 /* DSP State - exact copy of waterfall.c */
 static wf_lowpass_t g_detector_lowpass_i;
@@ -359,6 +365,17 @@ static socket_t tcp_connect(const char *host, int port) {
     return sock;
 }
 
+static bool set_nonblocking(socket_t sock) {
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(sock, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0) return false;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
 static bool tcp_recv_exact(socket_t sock, void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
@@ -377,6 +394,101 @@ static bool tcp_send_exact(socket_t sock, const void *buf, size_t len) {
         total += n;
     }
     return true;
+}
+
+/*============================================================================
+ * Control Channel JSON Helpers
+ *============================================================================*/
+
+/* Simple JSON string extractor: finds "key":"value" and copies value */
+static int json_get_string(const char *json, const char *key, char *out, size_t out_size) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    const char *end = strchr(start, '"');
+    if (!end) return -1;
+    
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return (int)len;
+}
+
+/* Simple JSON int extractor: finds "key":123 and returns value */
+static int json_get_int(const char *json, const char *key) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    return atoi(start);
+}
+
+/* Send a relay command: {"t":"r","c":"cmd",...}\n */
+static bool ctrl_send_relay_cmd(socket_t sock, const char *json_body) {
+    char buf[1024];
+    int len = snprintf(buf, sizeof(buf), "%s\n", json_body);
+    return tcp_send_exact(sock, buf, len);
+}
+
+/* Send SDR passthrough: {"t":"s","d":"escaped_data"}\n */
+static bool ctrl_send_sdr_data(socket_t sock, const char *data, int data_len) {
+    char buf[8192];
+    int pos = 0;
+    
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"t\":\"s\",\"d\":\"");
+    
+    /* Escape the data */
+    for (int i = 0; i < data_len && pos < (int)sizeof(buf) - 10; i++) {
+        char c = data[i];
+        if (c == '"') {
+            buf[pos++] = '\\';
+            buf[pos++] = '"';
+        } else if (c == '\\') {
+            buf[pos++] = '\\';
+            buf[pos++] = '\\';
+        } else if (c == '\n') {
+            buf[pos++] = '\\';
+            buf[pos++] = 'n';
+        } else if (c == '\r') {
+            buf[pos++] = '\\';
+            buf[pos++] = 'r';
+        } else if (c >= 32 && c < 127) {
+            buf[pos++] = c;
+        }
+        /* Drop other control chars */
+    }
+    
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\"}\n");
+    return tcp_send_exact(sock, buf, pos);
+}
+
+/* Unescape JSON string in-place, returns new length */
+static int json_unescape(char *str, int len) {
+    int r = 0, w = 0;
+    while (r < len) {
+        if (str[r] == '\\' && r + 1 < len) {
+            r++;
+            switch (str[r]) {
+                case 'n': str[w++] = '\n'; break;
+                case 'r': str[w++] = '\r'; break;
+                case 't': str[w++] = '\t'; break;
+                case '"': str[w++] = '"'; break;
+                case '\\': str[w++] = '\\'; break;
+                default: str[w++] = str[r]; break;
+            }
+            r++;
+        } else {
+            str[w++] = str[r++];
+        }
+    }
+    str[w] = '\0';
+    return w;
 }
 
 /*============================================================================
@@ -525,6 +637,7 @@ static bool connect_to_sdr_control(void) {
         return false;
     }
 
+    set_nonblocking(g_sdr_ctrl_socket);
     fprintf(stderr, "[SDR-CTRL] Connected (text protocol)\n");
     g_sdr_ctrl_connected = true;
     return true;
@@ -533,16 +646,132 @@ static bool connect_to_sdr_control(void) {
 static bool connect_to_relay_control(void) {
     if (g_relay_ctrl_connected) return true;
 
-    fprintf(stderr, "[RELAY-CTRL] Connecting to %s:%d...\n", g_relay_host, g_relay_ctrl_port);
+    /* Step 1: Connect to rendezvous port */
+    fprintf(stderr, "[RELAY-CTRL] Connecting to %s:%d (rendezvous)...\n", 
+            g_relay_host, DEFAULT_RELAY_RENDEZVOUS);
 
-    g_relay_ctrl_socket = tcp_connect(g_relay_host, g_relay_ctrl_port);
-    if (g_relay_ctrl_socket == SOCKET_INVALID) {
-        fprintf(stderr, "[RELAY-CTRL] Connection failed\n");
+    socket_t rendezvous = tcp_connect(g_relay_host, DEFAULT_RELAY_RENDEZVOUS);
+    if (rendezvous == SOCKET_INVALID) {
+        fprintf(stderr, "[RELAY-CTRL] Rendezvous connection failed\n");
         return false;
     }
 
-    fprintf(stderr, "[RELAY-CTRL] Connected (text protocol passthrough)\n");
+    /* Step 2: Send hello with our node ID */
+    char hello[256];
+    snprintf(hello, sizeof(hello), 
+             "{\"t\":\"r\",\"c\":\"hello\",\"id\":\"%s\"}\n", g_node_id);
+    if (!tcp_send_exact(rendezvous, hello, strlen(hello))) {
+        fprintf(stderr, "[RELAY-CTRL] Failed to send hello\n");
+        socket_close(rendezvous);
+        return false;
+    }
+
+    /* Step 3: Wait for port assignment (blocking read, short timeout) */
+    char buf[512];
+    int received = recv(rendezvous, buf, sizeof(buf) - 1, 0);
+    if (received <= 0) {
+        fprintf(stderr, "[RELAY-CTRL] No response from relay\n");
+        socket_close(rendezvous);
+        return false;
+    }
+    buf[received] = '\0';
+
+    /* Parse assignment: {"t":"r","c":"assign","p":3001} */
+    char cmd[32];
+    if (json_get_string(buf, "c", cmd, sizeof(cmd)) < 0 || strcmp(cmd, "assign") != 0) {
+        fprintf(stderr, "[RELAY-CTRL] Expected 'assign' command, got: %s\n", buf);
+        socket_close(rendezvous);
+        return false;
+    }
+
+    int assigned_port = json_get_int(buf, "p");
+    if (assigned_port <= 0) {
+        fprintf(stderr, "[RELAY-CTRL] Invalid port assignment: %s\n", buf);
+        socket_close(rendezvous);
+        return false;
+    }
+
+    fprintf(stderr, "[RELAY-CTRL] Assigned port %d\n", assigned_port);
+    g_relay_ctrl_port = assigned_port;
+
+    /* Step 4: Close rendezvous */
+    socket_close(rendezvous);
+
+    /* Step 5: Connect to assigned port */
+    fprintf(stderr, "[RELAY-CTRL] Connecting to %s:%d (control channel)...\n", 
+            g_relay_host, g_relay_ctrl_port);
+
+    g_relay_ctrl_socket = tcp_connect(g_relay_host, g_relay_ctrl_port);
+    if (g_relay_ctrl_socket == SOCKET_INVALID) {
+        fprintf(stderr, "[RELAY-CTRL] Control channel connection failed\n");
+        return false;
+    }
+
+    set_nonblocking(g_relay_ctrl_socket);
+    fprintf(stderr, "[RELAY-CTRL] Control channel established\n");
     g_relay_ctrl_connected = true;
+    g_ctrl_recv_len = 0;  /* Reset receive buffer */
+    
+    /* Step 6: Send ready with SDR status */
+    char ready[256];
+    snprintf(ready, sizeof(ready), 
+             "{\"t\":\"r\",\"c\":\"ready\",\"has_sdr\":%s}\n", 
+             g_sdr_connected ? "true" : "false");
+    if (!tcp_send_exact(g_relay_ctrl_socket, ready, strlen(ready))) {
+        fprintf(stderr, "[RELAY-CTRL] Failed to send ready\n");
+        socket_close(g_relay_ctrl_socket);
+        g_relay_ctrl_socket = SOCKET_INVALID;
+        g_relay_ctrl_connected = false;
+        return false;
+    }
+    
+    /* Step 7: Wait for port assignments (blocking read) */
+    /* Temporarily set blocking for this read */
+#ifdef _WIN32
+    u_long mode = 0;
+    ioctlsocket(g_relay_ctrl_socket, FIONBIO, &mode);
+#else
+    int flags = fcntl(g_relay_ctrl_socket, F_GETFL, 0);
+    fcntl(g_relay_ctrl_socket, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+
+    received = recv(g_relay_ctrl_socket, buf, sizeof(buf) - 1, 0);
+    
+    /* Set back to non-blocking */
+    set_nonblocking(g_relay_ctrl_socket);
+    
+    if (received <= 0) {
+        fprintf(stderr, "[RELAY-CTRL] No ports response from relay\n");
+        socket_close(g_relay_ctrl_socket);
+        g_relay_ctrl_socket = SOCKET_INVALID;
+        g_relay_ctrl_connected = false;
+        return false;
+    }
+    buf[received] = '\0';
+    
+    /* Parse ports: {"t":"r","c":"ports","det":3002,"disp":3003} */
+    if (json_get_string(buf, "c", cmd, sizeof(cmd)) < 0 || strcmp(cmd, "ports") != 0) {
+        fprintf(stderr, "[RELAY-CTRL] Expected 'ports' command, got: %s\n", buf);
+        socket_close(g_relay_ctrl_socket);
+        g_relay_ctrl_socket = SOCKET_INVALID;
+        g_relay_ctrl_connected = false;
+        return false;
+    }
+    
+    g_relay_det_port = json_get_int(buf, "det");
+    g_relay_disp_port = json_get_int(buf, "disp");
+    
+    if (g_relay_det_port <= 0 || g_relay_disp_port <= 0) {
+        fprintf(stderr, "[RELAY-CTRL] Invalid ports: %s\n", buf);
+        socket_close(g_relay_ctrl_socket);
+        g_relay_ctrl_socket = SOCKET_INVALID;
+        g_relay_ctrl_connected = false;
+        return false;
+    }
+    
+    fprintf(stderr, "[RELAY-CTRL] Assigned data ports: det=%d, disp=%d\n", 
+            g_relay_det_port, g_relay_disp_port);
+    
     return true;
 }
 
@@ -558,27 +787,115 @@ static void disconnect_from_control(void) {
         g_relay_ctrl_socket = SOCKET_INVALID;
     }
     g_relay_ctrl_connected = false;
+    g_ctrl_recv_len = 0;
 }
 
-static void forward_control_data(socket_t from_sock, socket_t to_sock, const char *label) {
+/* Forward SDR control data to relay (wraps in JSON frame) */
+static void forward_sdr_to_relay(void) {
+    if (!g_sdr_ctrl_connected || !g_relay_ctrl_connected) return;
+    
     char buffer[4096];
-    ssize_t received = recv(from_sock, buffer, sizeof(buffer) - 1, 0);
+    int received = recv(g_sdr_ctrl_socket, buffer, sizeof(buffer) - 1, 0);
 
     if (received <= 0) {
-        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (received < 0 && (socket_errno == EWOULDBLOCK_VAL)) {
             return;  /* No data available */
         }
-        fprintf(stderr, "[CTRL-%s] Connection lost\n", label);
-        disconnect_from_control();
+        fprintf(stderr, "[CTRL] SDR control connection lost\n");
+        if (g_sdr_ctrl_socket != SOCKET_INVALID) {
+            socket_close(g_sdr_ctrl_socket);
+            g_sdr_ctrl_socket = SOCKET_INVALID;
+        }
+        g_sdr_ctrl_connected = false;
         return;
     }
 
-    buffer[received] = '\0';
+    /* Wrap in JSON and send to relay */
+    if (!ctrl_send_sdr_data(g_relay_ctrl_socket, buffer, received)) {
+        fprintf(stderr, "[CTRL] Failed to forward to relay\n");
+    }
+}
 
-    /* Forward to destination */
-    if (send(to_sock, buffer, received, 0) < 0) {
-        fprintf(stderr, "[CTRL-%s] Forward failed\n", label);
-        disconnect_from_control();
+/* Process a single JSON message from relay */
+static void process_relay_message(const char *msg) {
+    char type[8];
+    if (json_get_string(msg, "t", type, sizeof(type)) < 0) {
+        fprintf(stderr, "[CTRL] Invalid message (no type): %s\n", msg);
+        return;
+    }
+    
+    if (type[0] == MSG_TYPE_RELAY) {
+        /* Relay command */
+        char cmd[32];
+        if (json_get_string(msg, "c", cmd, sizeof(cmd)) >= 0) {
+            if (strcmp(cmd, "ping") == 0) {
+                /* Respond to ping */
+                ctrl_send_relay_cmd(g_relay_ctrl_socket, "{\"t\":\"r\",\"c\":\"pong\"}");
+            } else if (strcmp(cmd, "status") == 0) {
+                /* TODO: Send status info */
+            }
+            /* Add more relay commands as needed */
+        }
+    } else if (type[0] == MSG_TYPE_SDR) {
+        /* SDR passthrough - forward to local SDR */
+        if (!g_sdr_ctrl_connected) return;
+        
+        char data[4096];
+        int len = json_get_string(msg, "d", data, sizeof(data));
+        if (len > 0) {
+            len = json_unescape(data, len);
+            if (send(g_sdr_ctrl_socket, data, len, 0) < 0) {
+                fprintf(stderr, "[CTRL] Failed to forward to SDR\n");
+            }
+        }
+    }
+}
+
+/* Read and process control data from relay */
+static void process_relay_control(void) {
+    if (!g_relay_ctrl_connected) return;
+    
+    /* Read into buffer */
+    int space = sizeof(g_ctrl_recv_buf) - g_ctrl_recv_len - 1;
+    if (space <= 0) {
+        fprintf(stderr, "[CTRL] Receive buffer overflow, resetting\n");
+        g_ctrl_recv_len = 0;
+        return;
+    }
+    
+    int received = recv(g_relay_ctrl_socket, g_ctrl_recv_buf + g_ctrl_recv_len, space, 0);
+    
+    if (received <= 0) {
+        if (received < 0 && (socket_errno == EWOULDBLOCK_VAL)) {
+            return;  /* No data available */
+        }
+        fprintf(stderr, "[CTRL] Relay control connection lost\n");
+        if (g_relay_ctrl_socket != SOCKET_INVALID) {
+            socket_close(g_relay_ctrl_socket);
+            g_relay_ctrl_socket = SOCKET_INVALID;
+        }
+        g_relay_ctrl_connected = false;
+        return;
+    }
+    
+    g_ctrl_recv_len += received;
+    g_ctrl_recv_buf[g_ctrl_recv_len] = '\0';
+    
+    /* Process complete messages (newline-delimited) */
+    char *start = g_ctrl_recv_buf;
+    char *newline;
+    while ((newline = strchr(start, '\n')) != NULL) {
+        *newline = '\0';
+        if (newline > start) {
+            process_relay_message(start);
+        }
+        start = newline + 1;
+    }
+    
+    /* Move incomplete message to front of buffer */
+    if (start > g_ctrl_recv_buf) {
+        g_ctrl_recv_len = strlen(start);
+        memmove(g_ctrl_recv_buf, start, g_ctrl_recv_len + 1);
     }
 }
 
@@ -833,18 +1150,6 @@ static void run(void) {
             }
         }
 
-        if (!g_relay_det_connected && strlen(g_relay_host) > 0 &&
-            (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
-            connect_to_relay_detector();
-            last_reconnect = now;
-        }
-
-        if (!g_relay_disp_connected && strlen(g_relay_host) > 0 &&
-            (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
-            connect_to_relay_display();
-            last_reconnect = now;
-        }
-
         /* Connect control paths */
         if (!g_sdr_ctrl_connected && g_sdr_connected &&
             (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
@@ -852,19 +1157,29 @@ static void run(void) {
             last_reconnect = now;
         }
 
+        /* Connect relay control first - it assigns det/disp ports */
         if (!g_relay_ctrl_connected && strlen(g_relay_host) > 0 &&
             (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
             connect_to_relay_control();
             last_reconnect = now;
         }
 
-        /* Forward control data bidirectionally */
-        if (g_sdr_ctrl_connected && g_relay_ctrl_connected) {
-            /* Relay → SDR */
-            forward_control_data(g_relay_ctrl_socket, g_sdr_ctrl_socket, "RELAY->SDR");
-            /* SDR → Relay */
-            forward_control_data(g_sdr_ctrl_socket, g_relay_ctrl_socket, "SDR->RELAY");
+        /* Connect det/disp after control (ports assigned during handshake) */
+        if (g_relay_ctrl_connected && !g_relay_det_connected && g_relay_det_port > 0 &&
+            (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
+            connect_to_relay_detector();
+            last_reconnect = now;
         }
+
+        if (g_relay_ctrl_connected && !g_relay_disp_connected && g_relay_disp_port > 0 &&
+            (now - last_reconnect >= (RECONNECT_DELAY_MS / 1000))) {
+            connect_to_relay_display();
+            last_reconnect = now;
+        }
+
+        /* Process control channel */
+        process_relay_control();     /* Relay → process/forward to SDR */
+        forward_sdr_to_relay();      /* SDR → wrap and send to Relay */
 
         /* Receive and process data from SDR */
         if (g_sdr_connected) {
@@ -921,7 +1236,6 @@ static void print_usage(const char *prog) {
     printf("  --relay-host HOST      Relay server hostname (required)\n");
     printf("  --relay-det PORT       Relay detector port (default: %d)\n", DEFAULT_RELAY_PORT_DET);
     printf("  --relay-disp PORT      Relay display port (default: %d)\n", DEFAULT_RELAY_PORT_DISP);
-    printf("  --relay-ctrl PORT      Relay control port (default: %d)\n", DEFAULT_RELAY_CTRL_PORT);
     printf("  --node-id ID           Discovery node ID (default: SPLITTER-1)\n");
     printf("  --no-discovery         Disable UDP discovery\n");
     printf("  -h, --help             Show this help\n\n");
@@ -929,7 +1243,7 @@ static void print_usage(const char *prog) {
     printf("  Input:  SDR server @ HOST:PORT (2 MHz I/Q, int16)\n");
     printf("  Output: Detector @ HOST:%d (50 kHz I/Q, float32)\n", DEFAULT_RELAY_PORT_DET);
     printf("  Output: Display @ HOST:%d (12 kHz I/Q, float32)\n", DEFAULT_RELAY_PORT_DISP);
-    printf("  Relay:  Control @ HOST:%d (bidirectional text)\n\n", DEFAULT_RELAY_CTRL_PORT);
+    printf("  Relay:  Control @ rendezvous %d, then assigned\n", DEFAULT_RELAY_RENDEZVOUS);
     printf("See: docs/SIGNAL_SPLITTER.md\n");
 }
 

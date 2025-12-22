@@ -63,16 +63,23 @@ typedef struct {
  * Configuration
  *============================================================================*/
 
+#define RENDEZVOUS_PORT     3000        /* Initial handshake port */
+#define SPLITTER_PORT_BASE  3001        /* First assigned splitter port */
+#define SPLITTER_PORT_MAX   3100        /* Last assigned splitter port */
 #define DETECTOR_PORT       4410
 #define DISPLAY_PORT        4411
-#define CONTROL_PORT        4409
-#define DISCOVERY_PORT      5401    /* TCP discovery coordinator */
+#define DISCOVERY_PORT      5401        /* TCP discovery coordinator */
+#define MAX_SPLITTERS       32          /* Max signal_splitters connected */
 #define MAX_CLIENTS         100
-#define MAX_EDGE_NODES      32      /* Max signal_splitters connected */
-#define MAX_SERVICES        128     /* Total services across all edges */
+#define MAX_EDGE_NODES      32          /* Max signal_splitters connected */
+#define MAX_SERVICES        128         /* Total services across all edges */
 #define CLIENT_BUFFER_SIZE  (50000 * 30)  /* 30 sec @ 50kHz (worst case) */
 #define STATUS_INTERVAL_SEC 5
-#define EDGE_TIMEOUT_SEC    120     /* Remove edge if no heartbeat */
+#define EDGE_TIMEOUT_SEC    120         /* Remove edge if no heartbeat */
+
+/* Control channel message types */
+#define MSG_TYPE_RELAY  'r'     /* Relay command */
+#define MSG_TYPE_SDR    's'     /* SDR passthrough */
 
 /*============================================================================
  * Discovery Protocol (JSON over TCP, newline-delimited)
@@ -103,6 +110,27 @@ typedef struct {
     int edge_idx;                   /* Which edge_node owns this */
     time_t registered;
 } service_entry_t;
+
+/* Splitter connection (control channel) */
+typedef struct {
+    int ctrl_fd;                    /* Control channel socket */
+    int listen_fd;                  /* Listening socket for control */
+    int assigned_port;              /* Control port assigned */
+    int client_fd;                  /* Remote client connected for control */
+    int det_listen_fd;              /* Listening socket for detector stream */
+    int det_source_fd;              /* Splitter detector stream connection */
+    int det_port;                   /* Detector port assigned */
+    int disp_listen_fd;             /* Listening socket for display stream */
+    int disp_source_fd;             /* Splitter display stream connection */
+    int disp_port;                  /* Display port assigned */
+    char node_id[64];               /* Splitter's node ID */
+    char ip[64];                    /* Splitter's IP */
+    time_t last_seen;               /* Last message timestamp */
+    char recv_buf[8192];            /* Buffer for partial JSON messages */
+    int recv_len;
+    bool active;                    /* Slot in use */
+    bool has_sdr;                   /* Splitter has SDR connected */
+} splitter_conn_t;
 
 /*============================================================================
  * Client Ring Buffer
@@ -306,16 +334,19 @@ static void client_list_send_pending(client_list_t *list) {
 static volatile bool g_running = true;
 static int g_detector_listen_fd = -1;
 static int g_display_listen_fd = -1;
-static int g_control_listen_fd = -1;
+static int g_rendezvous_listen_fd = -1;    /* Port 3000 for handshakes */
 static int g_discovery_listen_fd = -1;
 static int g_detector_source_fd = -1;
 static int g_display_source_fd = -1;
-static int g_control_source_fd = -1;  /* signal_splitter connection */
-static int g_control_client_fd = -1;  /* remote client connection */
 static client_list_t g_detector_clients;
 static client_list_t g_display_clients;
 static time_t g_start_time;
 static time_t g_last_status_time;
+
+/* Splitter connections */
+static splitter_conn_t g_splitters[MAX_SPLITTERS];
+static int g_splitter_count = 0;
+static int g_next_splitter_port = SPLITTER_PORT_BASE;
 
 /* Discovery coordinator state */
 static edge_node_t g_edge_nodes[MAX_EDGE_NODES];
@@ -331,6 +362,108 @@ static void signal_handler(int sig) {
     (void)sig;
     fprintf(stderr, "\n[SHUTDOWN] Received signal, shutting down...\n");
     g_running = false;
+}
+
+/*============================================================================
+ * JSON Helpers
+ *============================================================================*/
+
+/* Simple JSON string extractor: finds "key":"value" and copies value */
+static int json_get_string(const char *json, const char *key, char *out, size_t out_size) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    const char *end = strchr(start, '"');
+    if (!end) return -1;
+    
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return (int)len;
+}
+
+/* Simple JSON int extractor: finds "key":123 and returns value */
+static int json_get_int(const char *json, const char *key) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *start = strstr(json, pattern);
+    if (!start) return -1;
+    
+    start += strlen(pattern);
+    return atoi(start);
+}
+
+/* Unescape JSON string in-place, returns new length */
+static int json_unescape(char *str, int len) {
+    int r = 0, w = 0;
+    while (r < len) {
+        if (str[r] == '\\' && r + 1 < len) {
+            r++;
+            switch (str[r]) {
+                case 'n': str[w++] = '\n'; break;
+                case 'r': str[w++] = '\r'; break;
+                case 't': str[w++] = '\t'; break;
+                case '"': str[w++] = '"'; break;
+                case '\\': str[w++] = '\\'; break;
+                default: str[w++] = str[r]; break;
+            }
+            r++;
+        } else {
+            str[w++] = str[r++];
+        }
+    }
+    str[w] = '\0';
+    return w;
+}
+
+/*============================================================================
+ * Splitter Management
+ *============================================================================*/
+
+static int allocate_splitter_port(void) {
+    int port = g_next_splitter_port++;
+    if (g_next_splitter_port > SPLITTER_PORT_MAX) {
+        g_next_splitter_port = SPLITTER_PORT_BASE;
+    }
+    return port;
+}
+
+static splitter_conn_t* find_free_splitter_slot(void) {
+    for (int i = 0; i < MAX_SPLITTERS; i++) {
+        if (!g_splitters[i].active) {
+            return &g_splitters[i];
+        }
+    }
+    return NULL;
+}
+
+static void close_splitter(splitter_conn_t *sp) {
+    if (!sp || !sp->active) return;
+    
+    fprintf(stderr, "[SPLITTER] Closing %s (port %d)\n", sp->node_id, sp->assigned_port);
+    
+    if (sp->ctrl_fd >= 0) close(sp->ctrl_fd);
+    if (sp->client_fd >= 0) close(sp->client_fd);
+    if (sp->listen_fd >= 0) close(sp->listen_fd);
+    if (sp->det_listen_fd >= 0) close(sp->det_listen_fd);
+    if (sp->det_source_fd >= 0) close(sp->det_source_fd);
+    if (sp->disp_listen_fd >= 0) close(sp->disp_listen_fd);
+    if (sp->disp_source_fd >= 0) close(sp->disp_source_fd);
+    
+    memset(sp, 0, sizeof(*sp));
+    sp->ctrl_fd = -1;
+    sp->client_fd = -1;
+    sp->listen_fd = -1;
+    sp->det_listen_fd = -1;
+    sp->det_source_fd = -1;
+    sp->disp_listen_fd = -1;
+    sp->disp_source_fd = -1;
+    sp->active = false;
+    g_splitter_count--;
 }
 
 /*============================================================================
@@ -432,79 +565,264 @@ static bool receive_and_relay(int source_fd, client_list_t *clients, const char 
 }
 
 /*============================================================================
- * Control Path (Bidirectional Text Forwarding)
+ * Splitter Control Channel
  *============================================================================*/
 
-static void forward_control_data(int from_fd, int to_fd, const char *label) {
+/* Handle rendezvous connection - assign port and send to splitter */
+static void handle_rendezvous_accept(void) {
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    int fd = accept(g_rendezvous_listen_fd, (struct sockaddr*)&addr, &addr_len);
+    
+    if (fd < 0) return;
+    
+    char ip_str[64];
+    strncpy(ip_str, inet_ntoa(addr.sin_addr), sizeof(ip_str) - 1);
+    
+    fprintf(stderr, "[RENDEZVOUS] Connection from %s\n", ip_str);
+    
+    /* Read hello message (blocking, short timeout) */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    char buf[512];
+    ssize_t received = recv(fd, buf, sizeof(buf) - 1, 0);
+    if (received <= 0) {
+        fprintf(stderr, "[RENDEZVOUS] No hello received\n");
+        close(fd);
+        return;
+    }
+    buf[received] = '\0';
+    
+    /* Parse hello: {"t":"r","c":"hello","id":"SPLITTER-1"} */
+    char cmd[32], node_id[64];
+    if (json_get_string(buf, "c", cmd, sizeof(cmd)) < 0 || strcmp(cmd, "hello") != 0) {
+        fprintf(stderr, "[RENDEZVOUS] Expected 'hello', got: %s\n", buf);
+        close(fd);
+        return;
+    }
+    if (json_get_string(buf, "id", node_id, sizeof(node_id)) < 0) {
+        strncpy(node_id, "UNKNOWN", sizeof(node_id));
+    }
+    
+    /* Find a free splitter slot */
+    splitter_conn_t *sp = find_free_splitter_slot();
+    if (!sp) {
+        fprintf(stderr, "[RENDEZVOUS] No free splitter slots\n");
+        close(fd);
+        return;
+    }
+    
+    /* Allocate port and create listen socket */
+    int assigned_port = allocate_splitter_port();
+    int listen_fd = create_listen_socket(assigned_port);
+    if (listen_fd < 0) {
+        fprintf(stderr, "[RENDEZVOUS] Failed to create listen socket on port %d\n", assigned_port);
+        close(fd);
+        return;
+    }
+    set_nonblocking(listen_fd);
+    
+    /* Send port assignment */
+    char response[128];
+    int resp_len = snprintf(response, sizeof(response), 
+                            "{\"t\":\"r\",\"c\":\"assign\",\"p\":%d}\n", assigned_port);
+    if (send(fd, response, resp_len, 0) < 0) {
+        fprintf(stderr, "[RENDEZVOUS] Failed to send assignment\n");
+        close(fd);
+        close(listen_fd);
+        return;
+    }
+    
+    /* Close rendezvous connection (splitter will reconnect to assigned port) */
+    close(fd);
+    
+    /* Initialize splitter slot */
+    memset(sp, 0, sizeof(*sp));
+    sp->active = true;
+    sp->assigned_port = assigned_port;
+    sp->listen_fd = listen_fd;
+    sp->ctrl_fd = -1;
+    sp->client_fd = -1;
+    strncpy(sp->node_id, node_id, sizeof(sp->node_id) - 1);
+    strncpy(sp->ip, ip_str, sizeof(sp->ip) - 1);
+    sp->last_seen = time(NULL);
+    sp->recv_len = 0;
+    g_splitter_count++;
+    
+    fprintf(stderr, "[RENDEZVOUS] Assigned port %d to %s, waiting for reconnect\n", 
+            assigned_port, node_id);
+}
+
+/* Accept splitter connection on assigned port */
+static void handle_splitter_accept(splitter_conn_t *sp) {
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    int fd = accept(sp->listen_fd, (struct sockaddr*)&addr, &addr_len);
+    
+    if (fd < 0) return;
+    
+    set_nonblocking(fd);
+    
+    if (sp->ctrl_fd < 0) {
+        /* First connection is the splitter itself */
+        sp->ctrl_fd = fd;
+        sp->last_seen = time(NULL);
+        fprintf(stderr, "[SPLITTER] %s connected on port %d\n", sp->node_id, sp->assigned_port);
+    } else if (sp->client_fd < 0) {
+        /* Second connection is a remote client */
+        sp->client_fd = fd;
+        fprintf(stderr, "[SPLITTER] Client connected to %s\n", sp->node_id);
+    } else {
+        /* No more slots */
+        fprintf(stderr, "[SPLITTER] Rejecting extra connection to %s\n", sp->node_id);
+        close(fd);
+    }
+}
+
+/* Send SDR passthrough wrapped in JSON */
+static bool splitter_send_sdr(splitter_conn_t *sp, const char *data, int len) {
+    char buf[8192];
+    int pos = 0;
+    
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "{\"t\":\"s\",\"d\":\"");
+    
+    /* Escape the data */
+    for (int i = 0; i < len && pos < (int)sizeof(buf) - 10; i++) {
+        char c = data[i];
+        if (c == '"') { buf[pos++] = '\\'; buf[pos++] = '"'; }
+        else if (c == '\\') { buf[pos++] = '\\'; buf[pos++] = '\\'; }
+        else if (c == '\n') { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+        else if (c == '\r') { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+        else if (c >= 32 && c < 127) { buf[pos++] = c; }
+    }
+    
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\"}\n");
+    return send(sp->ctrl_fd, buf, pos, MSG_NOSIGNAL) == pos;
+}
+
+/* Process a single JSON message from splitter */
+static void process_splitter_message(splitter_conn_t *sp, const char *msg) {
+    char type[8];
+    if (json_get_string(msg, "t", type, sizeof(type)) < 0) return;
+    
+    if (type[0] == MSG_TYPE_RELAY) {
+        /* Relay command from splitter */
+        char cmd[32];
+        if (json_get_string(msg, "c", cmd, sizeof(cmd)) >= 0) {
+            if (strcmp(cmd, "pong") == 0) {
+                sp->last_seen = time(NULL);
+            } else if (strcmp(cmd, "ready") == 0) {
+                /* Splitter is ready - check has_sdr and assign data ports */
+                char has_sdr_str[16];
+                sp->has_sdr = (json_get_string(msg, "has_sdr", has_sdr_str, sizeof(has_sdr_str)) >= 0 
+                               && strcmp(has_sdr_str, "true") == 0);
+                
+                /* Allocate detector and display ports */
+                sp->det_port = allocate_splitter_port();
+                sp->disp_port = allocate_splitter_port();
+                
+                /* Create listen sockets */
+                sp->det_listen_fd = create_listen_socket(sp->det_port);
+                sp->disp_listen_fd = create_listen_socket(sp->disp_port);
+                
+                if (sp->det_listen_fd < 0 || sp->disp_listen_fd < 0) {
+                    fprintf(stderr, "[SPLITTER] Failed to create data listen sockets\n");
+                    close_splitter(sp);
+                    return;
+                }
+                
+                set_nonblocking(sp->det_listen_fd);
+                set_nonblocking(sp->disp_listen_fd);
+                
+                /* Send port assignment */
+                char response[128];
+                int len = snprintf(response, sizeof(response),
+                                   "{\"t\":\"r\",\"c\":\"ports\",\"det\":%d,\"disp\":%d}\n",
+                                   sp->det_port, sp->disp_port);
+                send(sp->ctrl_fd, response, len, MSG_NOSIGNAL);
+                
+                fprintf(stderr, "[SPLITTER] %s assigned data ports: det=%d, disp=%d (has_sdr=%d)\n",
+                        sp->node_id, sp->det_port, sp->disp_port, sp->has_sdr);
+            }
+            /* Add more relay commands as needed */
+        }
+    } else if (type[0] == MSG_TYPE_SDR) {
+        /* SDR response - forward to client */
+        if (sp->client_fd < 0) return;
+        
+        char data[4096];
+        int len = json_get_string(msg, "d", data, sizeof(data));
+        if (len > 0) {
+            len = json_unescape(data, len);
+            send(sp->client_fd, data, len, MSG_NOSIGNAL);
+        }
+    }
+}
+
+/* Read and process control data from splitter */
+static void handle_splitter_data(splitter_conn_t *sp) {
+    int space = sizeof(sp->recv_buf) - sp->recv_len - 1;
+    if (space <= 0) {
+        sp->recv_len = 0;
+        return;
+    }
+    
+    ssize_t received = recv(sp->ctrl_fd, sp->recv_buf + sp->recv_len, space, 0);
+    
+    if (received <= 0) {
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        fprintf(stderr, "[SPLITTER] %s disconnected\n", sp->node_id);
+        close_splitter(sp);
+        return;
+    }
+    
+    sp->recv_len += received;
+    sp->recv_buf[sp->recv_len] = '\0';
+    sp->last_seen = time(NULL);
+    
+    /* Process complete messages */
+    char *start = sp->recv_buf;
+    char *newline;
+    while ((newline = strchr(start, '\n')) != NULL) {
+        *newline = '\0';
+        if (newline > start) {
+            process_splitter_message(sp, start);
+        }
+        start = newline + 1;
+    }
+    
+    /* Move incomplete message to front */
+    if (start > sp->recv_buf) {
+        sp->recv_len = strlen(start);
+        memmove(sp->recv_buf, start, sp->recv_len + 1);
+    }
+}
+
+/* Handle data from client connected to splitter */
+static void handle_client_to_splitter(splitter_conn_t *sp) {
     char buffer[4096];
-    ssize_t received = recv(from_fd, buffer, sizeof(buffer), 0);
-
-    if (received < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "[CTRL-%s] Connection lost\n", label);
-            if (from_fd == g_control_source_fd || to_fd == g_control_source_fd) {
-                if (g_control_source_fd >= 0) close(g_control_source_fd);
-                g_control_source_fd = -1;
-            }
-            if (from_fd == g_control_client_fd || to_fd == g_control_client_fd) {
-                if (g_control_client_fd >= 0) close(g_control_client_fd);
-                g_control_client_fd = -1;
-            }
+    ssize_t received = recv(sp->client_fd, buffer, sizeof(buffer), 0);
+    
+    if (received <= 0) {
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
         }
+        fprintf(stderr, "[SPLITTER] Client disconnected from %s\n", sp->node_id);
+        close(sp->client_fd);
+        sp->client_fd = -1;
         return;
     }
-
-    if (received == 0) {
-        fprintf(stderr, "[CTRL-%s] Connection closed\n", label);
-        if (from_fd == g_control_source_fd || to_fd == g_control_source_fd) {
-            if (g_control_source_fd >= 0) close(g_control_source_fd);
-            g_control_source_fd = -1;
-        }
-        if (from_fd == g_control_client_fd || to_fd == g_control_client_fd) {
-            if (g_control_client_fd >= 0) close(g_control_client_fd);
-            g_control_client_fd = -1;
-        }
-        return;
-    }
-
-    /* Forward to destination */
-    ssize_t sent = send(to_fd, buffer, received, MSG_NOSIGNAL);
-    if (sent < 0) {
-        fprintf(stderr, "[CTRL-%s] Forward failed\n", label);
-    }
+    
+    /* Forward to splitter as SDR command */
+    splitter_send_sdr(sp, buffer, received);
 }
 
 /*============================================================================
  * Discovery Coordinator (TCP Registry)
  *============================================================================*/
-
-/* Simple JSON value extractor - finds "key":"value" and returns value */
-static int json_get_string(const char *json, const char *key, char *out, size_t out_size) {
-    char pattern[128];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
-    const char *start = strstr(json, pattern);
-    if (!start) return -1;
-    
-    start += strlen(pattern);
-    const char *end = strchr(start, '"');
-    if (!end) return -1;
-    
-    size_t len = end - start;
-    if (len >= out_size) len = out_size - 1;
-    memcpy(out, start, len);
-    out[len] = '\0';
-    return 0;
-}
-
-static int json_get_int(const char *json, const char *key) {
-    char pattern[128];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    const char *start = strstr(json, pattern);
-    if (!start) return -1;
-    
-    start += strlen(pattern);
-    return atoi(start);
-}
 
 /* Find edge node by fd */
 static int find_edge_by_fd(int fd) {
@@ -798,11 +1116,11 @@ static void run(void) {
         /* Listen sockets */
         FD_SET(g_detector_listen_fd, &readfds);
         FD_SET(g_display_listen_fd, &readfds);
-        FD_SET(g_control_listen_fd, &readfds);
+        FD_SET(g_rendezvous_listen_fd, &readfds);
         FD_SET(g_discovery_listen_fd, &readfds);
         max_fd = g_detector_listen_fd;
         if (g_display_listen_fd > max_fd) max_fd = g_display_listen_fd;
-        if (g_control_listen_fd > max_fd) max_fd = g_control_listen_fd;
+        if (g_rendezvous_listen_fd > max_fd) max_fd = g_rendezvous_listen_fd;
         if (g_discovery_listen_fd > max_fd) max_fd = g_discovery_listen_fd;
 
         /* Source sockets */
@@ -814,13 +1132,40 @@ static void run(void) {
             FD_SET(g_display_source_fd, &readfds);
             if (g_display_source_fd > max_fd) max_fd = g_display_source_fd;
         }
-        if (g_control_source_fd >= 0) {
-            FD_SET(g_control_source_fd, &readfds);
-            if (g_control_source_fd > max_fd) max_fd = g_control_source_fd;
-        }
-        if (g_control_client_fd >= 0) {
-            FD_SET(g_control_client_fd, &readfds);
-            if (g_control_client_fd > max_fd) max_fd = g_control_client_fd;
+        
+        /* Splitter sockets */
+        for (int i = 0; i < MAX_SPLITTERS; i++) {
+            splitter_conn_t *sp = &g_splitters[i];
+            if (!sp->active) continue;
+            
+            if (sp->listen_fd >= 0) {
+                FD_SET(sp->listen_fd, &readfds);
+                if (sp->listen_fd > max_fd) max_fd = sp->listen_fd;
+            }
+            if (sp->ctrl_fd >= 0) {
+                FD_SET(sp->ctrl_fd, &readfds);
+                if (sp->ctrl_fd > max_fd) max_fd = sp->ctrl_fd;
+            }
+            if (sp->client_fd >= 0) {
+                FD_SET(sp->client_fd, &readfds);
+                if (sp->client_fd > max_fd) max_fd = sp->client_fd;
+            }
+            if (sp->det_listen_fd >= 0) {
+                FD_SET(sp->det_listen_fd, &readfds);
+                if (sp->det_listen_fd > max_fd) max_fd = sp->det_listen_fd;
+            }
+            if (sp->det_source_fd >= 0) {
+                FD_SET(sp->det_source_fd, &readfds);
+                if (sp->det_source_fd > max_fd) max_fd = sp->det_source_fd;
+            }
+            if (sp->disp_listen_fd >= 0) {
+                FD_SET(sp->disp_listen_fd, &readfds);
+                if (sp->disp_listen_fd > max_fd) max_fd = sp->disp_listen_fd;
+            }
+            if (sp->disp_source_fd >= 0) {
+                FD_SET(sp->disp_source_fd, &readfds);
+                if (sp->disp_source_fd > max_fd) max_fd = sp->disp_source_fd;
+            }
         }
         
         /* Edge node sockets */
@@ -849,29 +1194,70 @@ static void run(void) {
             handle_source_connection(&g_display_source_fd, g_display_listen_fd, "DISPLAY");
         }
 
-        /* Accept control connections */
-        if (FD_ISSET(g_control_listen_fd, &readfds)) {
-            struct sockaddr_in addr;
-            socklen_t addr_len = sizeof(addr);
-            int fd = accept(g_control_listen_fd, (struct sockaddr*)&addr, &addr_len);
-
-            if (fd >= 0) {
-                /* Source = signal_splitter (single connection) */
-                if (g_control_source_fd < 0) {
+        /* Accept rendezvous connections (new splitters) */
+        if (FD_ISSET(g_rendezvous_listen_fd, &readfds)) {
+            handle_rendezvous_accept();
+        }
+        
+        /* Handle splitter connections */
+        for (int i = 0; i < MAX_SPLITTERS; i++) {
+            splitter_conn_t *sp = &g_splitters[i];
+            if (!sp->active) continue;
+            
+            /* Accept on splitter's control listen socket */
+            if (sp->listen_fd >= 0 && FD_ISSET(sp->listen_fd, &readfds)) {
+                handle_splitter_accept(sp);
+            }
+            
+            /* Accept on splitter's detector listen socket */
+            if (sp->det_listen_fd >= 0 && FD_ISSET(sp->det_listen_fd, &readfds)) {
+                struct sockaddr_in addr;
+                socklen_t addr_len = sizeof(addr);
+                int fd = accept(sp->det_listen_fd, (struct sockaddr*)&addr, &addr_len);
+                if (fd >= 0) {
                     set_nonblocking(fd);
-                    g_control_source_fd = fd;
-                    fprintf(stderr, "[CTRL-SOURCE] Connected from %s:%d\n",
-                            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+                    sp->det_source_fd = fd;
+                    fprintf(stderr, "[SPLITTER] %s detector stream connected (port %d)\n", 
+                            sp->node_id, sp->det_port);
                 }
-                /* Client = remote user (single connection, reject if occupied) */
-                else if (g_control_client_fd < 0) {
+            }
+            
+            /* Accept on splitter's display listen socket */
+            if (sp->disp_listen_fd >= 0 && FD_ISSET(sp->disp_listen_fd, &readfds)) {
+                struct sockaddr_in addr;
+                socklen_t addr_len = sizeof(addr);
+                int fd = accept(sp->disp_listen_fd, (struct sockaddr*)&addr, &addr_len);
+                if (fd >= 0) {
                     set_nonblocking(fd);
-                    g_control_client_fd = fd;
-                    fprintf(stderr, "[CTRL-CLIENT] Connected from %s:%d\n",
-                            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-                } else {
-                    fprintf(stderr, "[CTRL] Rejecting connection (already occupied)\n");
-                    close(fd);
+                    sp->disp_source_fd = fd;
+                    fprintf(stderr, "[SPLITTER] %s display stream connected (port %d)\n", 
+                            sp->node_id, sp->disp_port);
+                }
+            }
+            
+            /* Data from splitter control channel */
+            if (sp->ctrl_fd >= 0 && FD_ISSET(sp->ctrl_fd, &readfds)) {
+                handle_splitter_data(sp);
+            }
+            
+            /* Data from client connected to splitter */
+            if (sp->client_fd >= 0 && FD_ISSET(sp->client_fd, &readfds)) {
+                handle_client_to_splitter(sp);
+            }
+            
+            /* Detector stream data - relay to clients */
+            if (sp->det_source_fd >= 0 && FD_ISSET(sp->det_source_fd, &readfds)) {
+                if (!receive_and_relay(sp->det_source_fd, &g_detector_clients, "DETECTOR")) {
+                    close(sp->det_source_fd);
+                    sp->det_source_fd = -1;
+                }
+            }
+            
+            /* Display stream data - relay to clients */
+            if (sp->disp_source_fd >= 0 && FD_ISSET(sp->disp_source_fd, &readfds)) {
+                if (!receive_and_relay(sp->disp_source_fd, &g_display_clients, "DISPLAY")) {
+                    close(sp->disp_source_fd);
+                    sp->disp_source_fd = -1;
                 }
             }
         }
