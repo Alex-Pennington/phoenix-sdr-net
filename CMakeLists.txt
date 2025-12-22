@@ -37,6 +37,14 @@ else()
     message(FATAL_ERROR "phoenix-sdr-core not found. Run: git submodule update --init --recursive")
 endif()
 
+# phoenix-discovery (submodule)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/CMakeLists.txt")
+    add_subdirectory(external/phoenix-discovery)
+    message(STATUS "Using phoenix-discovery from external/")
+else()
+    message(FATAL_ERROR "phoenix-discovery not found. Run: git submodule update --init --recursive")
+endif()
+
 #============================================================================
 # Version header
 #============================================================================
@@ -99,10 +107,13 @@ add_executable(signal_splitter
     src/signal_splitter.c
     src/waterfall_dsp.c
 )
-target_include_directories(signal_splitter PRIVATE ${PHOENIX_NET_INCLUDES})
-target_link_libraries(signal_splitter PRIVATE m)
+target_include_directories(signal_splitter PRIVATE 
+    ${PHOENIX_NET_INCLUDES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/include
+)
+target_link_libraries(signal_splitter PRIVATE pn_discovery m)
 if(WIN32)
-    target_link_libraries(signal_splitter PRIVATE ws2_32)
+    target_link_libraries(signal_splitter PRIVATE ws2_32 iphlpapi)
 else()
     target_link_libraries(signal_splitter PRIVATE pthread)
 endif()
