@@ -30,6 +30,7 @@
 
 #include "waterfall_dsp.h"
 #include "version.h"
+#include "pn_discovery.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -213,7 +214,7 @@ static uint32_t g_sdr_sample_rate = SDR_SAMPLE_RATE;
 /* Relay connections */
 static socket_t g_relay_det_socket = SOCKET_INVALID;
 static socket_t g_relay_disp_socket = SOCKET_INVALID;
-static char g_relay_host[256] = "";
+static char g_relay_host[256] = "146.190.112.225";
 static int g_relay_det_port = DEFAULT_RELAY_PORT_DET;
 static int g_relay_disp_port = DEFAULT_RELAY_PORT_DISP;
 static bool g_relay_det_connected = false;
@@ -247,6 +248,17 @@ static float g_display_frame[RELAY_FRAME_SIZE * 2];
 static int g_detector_frame_idx = 0;
 static int g_display_frame_idx = 0;
 
+/* Discovery state */
+static bool g_discovery_enabled = true;
+static char g_node_id[64] = "SPLITTER-1";
+
+/* Service type constants */
+#define PN_SVC_SDR_SERVER       "sdr_server"
+#define PN_SVC_SIGNAL_SPLITTER  "signal_splitter"
+#define PN_SVC_WATERFALL        "waterfall"
+#define PN_SVC_CONTROLLER       "controller"
+#define PN_SVC_DETECTOR         "detector"
+
 /* Statistics */
 static uint64_t g_samples_received = 0;
 static uint64_t g_detector_samples_sent = 0;
@@ -254,6 +266,35 @@ static uint64_t g_display_samples_sent = 0;
 static uint64_t g_detector_samples_dropped = 0;
 static uint64_t g_display_samples_dropped = 0;
 static time_t g_last_status_time = 0;
+
+/*============================================================================
+ * Discovery Callback
+ *============================================================================*/
+
+static void on_service_discovered(const char *id, const char *service,
+                                   const char *ip, int ctrl_port, int data_port,
+                                   const char *caps, bool is_bye, void *userdata) {
+    (void)userdata;
+    (void)caps;
+    (void)data_port;
+    
+    if (is_bye) {
+        fprintf(stderr, "[DISCOVERY] Service left: %s '%s'\n", service, id);
+        return;
+    }
+    
+    fprintf(stderr, "[DISCOVERY] Found %s '%s' at %s:%d\n", service, id, ip, ctrl_port);
+    
+    /* If we found an sdr_server and we're configured for localhost/auto, use it */
+    if (strcmp(service, PN_SVC_SDR_SERVER) == 0) {
+        if (strcmp(g_sdr_host, "localhost") == 0 || strcmp(g_sdr_host, "auto") == 0) {
+            fprintf(stderr, "[DISCOVERY] Auto-connecting to sdr_server at %s:%d\n", ip, data_port);
+            strncpy(g_sdr_host, ip, sizeof(g_sdr_host) - 1);
+            if (data_port > 0) g_sdr_port = data_port;
+            if (ctrl_port > 0) g_sdr_ctrl_port = ctrl_port;
+        }
+    }
+}
 
 /*============================================================================
  * Signal Handler
@@ -879,6 +920,8 @@ static void print_usage(const char *prog) {
     printf("  --relay-det PORT       Relay detector port (default: %d)\n", DEFAULT_RELAY_PORT_DET);
     printf("  --relay-disp PORT      Relay display port (default: %d)\n", DEFAULT_RELAY_PORT_DISP);
     printf("  --relay-ctrl PORT      Relay control port (default: %d)\n", DEFAULT_RELAY_CTRL_PORT);
+    printf("  --node-id ID           Node ID for discovery (default: SPLITTER-1)\n");
+    printf("  --no-discovery         Disable service discovery\n");
     printf("  -h, --help             Show this help\n\n");
     printf("Streams:\n");
     printf("  Input:  SDR server @ HOST:PORT (2 MHz I/Q, int16)\n");
@@ -903,6 +946,10 @@ int main(int argc, char *argv[]) {
             g_relay_det_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--relay-disp") == 0 && i + 1 < argc) {
             g_relay_disp_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--node-id") == 0 && i + 1 < argc) {
+            strncpy(g_node_id, argv[++i], sizeof(g_node_id) - 1);
+        } else if (strcmp(argv[i], "--no-discovery") == 0) {
+            g_discovery_enabled = false;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -952,6 +999,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize discovery */
+    if (g_discovery_enabled) {
+        if (pn_discovery_init(0) == 0) {
+            pn_listen(on_service_discovered, NULL);
+            pn_announce(g_node_id, PN_SVC_SIGNAL_SPLITTER, 
+                       g_relay_det_port, g_relay_disp_port, "modem,display");
+            fprintf(stderr, "[DISCOVERY] Announcing as %s\n", g_node_id);
+        } else {
+            fprintf(stderr, "[DISCOVERY] Failed to initialize, continuing without discovery\n");
+            g_discovery_enabled = false;
+        }
+    }
+
     fprintf(stderr, "[STARTUP] Ready to process signals\n\n");
     g_last_status_time = time(NULL);
 
@@ -960,6 +1020,12 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     fprintf(stderr, "\n[SHUTDOWN] Closing connections...\n");
+    
+    /* Shutdown discovery */
+    if (g_discovery_enabled) {
+        pn_discovery_shutdown();
+    }
+    
     disconnect_from_sdr();
     disconnect_from_relay();
     disconnect_from_control();
