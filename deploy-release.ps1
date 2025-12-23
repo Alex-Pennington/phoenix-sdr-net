@@ -94,10 +94,10 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Build failed"; exit 1 }
 
 # Check that executables exist
 $exePath1 = Join-Path (Join-Path (Join-Path $projectRoot "build") "msys2-ucrt64") "sdr_server.exe"
-$exePath2 = Join-Path (Join-Path (Join-Path $projectRoot "build") "msys2-ucrt64") "signal_splitter.exe"
+$exePath2 = Join-Path (Join-Path (Join-Path $projectRoot "build") "msys2-ucrt64") "telem_logger.exe"
 
 if (-not (Test-Path $exePath1)) { Write-Error "sdr_server.exe not found"; exit 1 }
-if (-not (Test-Path $exePath2)) { Write-Error "signal_splitter.exe not found"; exit 1 }
+if (-not (Test-Path $exePath2)) { Write-Error "telem_logger.exe not found"; exit 1 }
 
 Write-Host "`nBuild successful!" -ForegroundColor Green
 
