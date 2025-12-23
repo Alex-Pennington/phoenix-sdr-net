@@ -1,0 +1,16 @@
+{
+    "githubRepo":  "Alex-Pennington/phoenix-sdr-net",
+    "projectName":  "phoenix-sdr-net",
+    "packageFiles":  [
+                         "README.md",
+                         "LICENSE",
+                         "docs/IQ_STREAMING.md"
+                     ],
+    "dlls":  [
+                 "sdrplay_api.dll"
+             ],
+    "executables":  [
+                        "sdr_server.exe",
+                        "telem_logger.exe"
+                    ]
+}

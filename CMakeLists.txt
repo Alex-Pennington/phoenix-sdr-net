@@ -9,6 +9,9 @@ project(phoenix-sdr-net
     LANGUAGES C
 )
 
+# Phoenix Build System integration
+include(external/phoenix-build-scripts/cmake/phoenix-build.cmake)
+
 # C standard
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -44,30 +47,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/CMakeLists.txt
 else()
     message(FATAL_ERROR "phoenix-discovery not found. Run: git submodule update --init --recursive")
 endif()
-
-#============================================================================
-# Version header
-#============================================================================
-
-# Get git info
-find_package(Git QUIET)
-if(GIT_FOUND)
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        OUTPUT_VARIABLE GIT_COMMIT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-else()
-    set(GIT_COMMIT "unknown")
-endif()
-
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/include/version.h"
-    @ONLY
-)
 
 #============================================================================
 # Common include directories

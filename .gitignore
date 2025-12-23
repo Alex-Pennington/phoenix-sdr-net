@@ -35,3 +35,8 @@ venv/
 # Temporary files
 *.tmp
 *.bak
+
+# Phoenix Build System
+build/
+install/
+*.zip
