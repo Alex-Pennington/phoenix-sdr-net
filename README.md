@@ -8,7 +8,7 @@
 
 ## Overview
 
-Network streaming and relay tools for the Phoenix Nest SDR system. Enables distributed SDR processing with TCP-based I/Q streaming, signal splitting, and multi-client broadcast.
+Network streaming and telemetry tools for the Phoenix Nest SDR system. Provides TCP-based I/Q streaming from SDR hardware and UDP telemetry logging for distributed processing.
 
 ---
 
@@ -17,9 +17,7 @@ Network streaming and relay tools for the Phoenix Nest SDR system. Enables distr
 | Tool | Description |
 |------|-------------|
 | `sdr_server` | TCP control + I/Q streaming with Phoenix Nest discovery |
-| `signal_splitter` | Splits 2 MHz I/Q into detector (50k) + display (12k) with control passthrough |
-| `signal_relay` | Multi-client broadcast relay (runs on cloud server) |
-| `wormhole` | MIL-STD-188-110A constellation display |
+| `telem_logger` | UDP telemetry listener and CSV logger with system tray support |
 | `test_iq_client.py` | Python test client for I/Q streaming |
 
 ---
@@ -39,29 +37,22 @@ Network streaming and relay tools for the Phoenix Nest SDR system. Enables distr
 │          ▼                                                                  │
 │   ┌──────────────┐     Control: 4535        ┌──────────────┐               │
 │   │  sdr_server  │◄─────────────────────────│   Clients    │               │
-│   │              │     I/Q: 4536            │  (control)   │               │
-│   └──────┬───────┘─────────────────────────►└──────────────┘               │
-│          │ 2 MHz I/Q                                                        │
+│   │              │     I/Q: 4536            │ (TCP/UDP)    │               │
+│   │              │─────────────────────────►└──────────────┘               │
+│   └──────┬───────┘     2 MHz I/Q                                            │
+│          │                                                                  │
+│          │  UDP Telemetry (optional)                                        │
+│          │  Port 3005                                                       │
 │          ▼                                                                  │
-│   ┌──────────────────────────────────┐                                     │
-│   │         signal_splitter          │                                     │
-│   │  ┌─────────────┐ ┌─────────────┐ │                                     │
-│   │  │ Detector    │ │ Display     │ │                                     │
-│   │  │ Path (50k)  │ │ Path (12k)  │ │                                     │
-│   │  └──────┬──────┘ └──────┬──────┘ │                                     │
-│   └─────────┼───────────────┼────────┘                                     │
-│             │               │                                               │
-│             ▼               ▼                                               │
-│   ┌─────────────────────────────────┐                                      │
-│   │        signal_relay             │                                      │
-│   │   Port 4410      Port 4411      │                                      │
-│   └─────────┬───────────────┬───────┘                                      │
-│             │               │                                               │
-│             ▼               ▼                                               │
-│   ┌──────────────┐ ┌──────────────┐                                        │
-│   │  Detector    │ │  Waterfall   │                                        │
-│   │  Clients     │ │  Displays    │                                        │
-│   └──────────────┘ └──────────────┘                                        │
+│   ┌──────────────┐                                                          │
+│   │ telem_logger │                                                          │
+│   │              │                                                          │
+│   │ CSV Files:   │                                                          │
+│   │ • CHAN       │                                                          │
+│   │ • TICK       │                                                          │
+│   │ • MARK       │                                                          │
+│   │ • SYNC       │                                                          │
+│   └──────────────┘                                                          │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -96,70 +87,36 @@ sdr_server.exe [-p control_port] [-i iq_port] [--node-id ID] [--no-discovery]
 
 ---
 
-### signal_splitter
+### telem_logger
 
-Splits high-rate I/Q stream into multiple lower-rate streams with bidirectional control passthrough.
+UDP telemetry listener and CSV logger. Captures telemetry broadcasts from processing tools and organizes them into channel-specific CSV files.
 
-**Input:** 2 MHz I/Q from sdr_server:4536
-
-**Output:**
-- Port 4410: 50 kHz detector stream (float32 I/Q)
-- Port 4411: 12 kHz display stream (float32 I/Q)
-- Port 4409: Control passthrough (relay ↔ SDR server)
-
-**Default Relay:** 146.190.112.225 (configurable)
-
-**Usage:**
-```bash
-signal_splitter.exe [--sdr-host localhost] [--relay-host IP] [--relay-det 4410] [--relay-disp 4411]
-```
-
-**Processing:**
-- 5 kHz lowpass filter on both paths
-- 40:1 decimation for detector path
-- 166:1 decimation for display path
-- Automatic reconnection on network failures
-
----
-
-### signal_relay
-
-Multi-client broadcast relay server. Accepts one producer connection and broadcasts to multiple consumers.
-
-**Deployment:** Cloud server (146.190.112.225)
-
-**Ports:**
-- 4409: Control relay (bidirectional text protocol)
-- 4410: Detector stream relay (50 kHz float32)
-- 4411: Display stream relay (12 kHz float32)
+**Port:** 3005 (UDP, configurable)
 
 **Features:**
-- Ring buffer per client (30 seconds)
-- Automatic slow client disconnection
-- Producer reconnection handling
-- Stream header forwarding to new clients
-- Control command passthrough
+- System tray operation (Windows)
+- Per-channel CSV files with timestamps
+- Pause/Resume logging
+- Channel filtering
+- Verbose console output mode
 
 **Usage:**
 ```bash
-./signal_relay
+telem_logger.exe [-p 3005] [-o logs/] [-c CHAN,TICK,MARK] [-v] [--no-tray]
 ```
 
----
-
-### wormhole
-
-MIL-STD-188-110A constellation display for PSK signal visualization.
-
-**Parameters:**
-- Sample Rate: 48 kHz
-- Symbol Rate: 2400 baud
-- Center Frequency: 1800 Hz
-
-**Usage:**
-```bash
-wormhole.exe [pcm_directory]
+**Output Files:**
 ```
+telem_CHAN_YYYYMMDD_HHMMSS.csv  # Channel quality metrics
+telem_TICK_YYYYMMDD_HHMMSS.csv  # Tick pulse detections
+telem_MARK_YYYYMMDD_HHMMSS.csv  # Minute marker events
+telem_SYNC_YYYYMMDD_HHMMSS.csv  # Sync state transitions
+```
+
+**System Tray:**
+- Tooltip shows message count and active channels
+- Right-click menu for pause/resume, open logs folder, exit
+- Graceful shutdown with file footers
 
 ---
 

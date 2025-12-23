@@ -105,33 +105,13 @@ else()
     target_link_libraries(sdr_server PRIVATE pthread)
 endif()
 
-# Signal Splitter - Split I/Q to detector/display paths (Windows + Linux)
-add_executable(signal_splitter 
-    src/signal_splitter.c
-    src/waterfall_dsp.c
-)
-target_include_directories(signal_splitter PRIVATE 
-    ${PHOENIX_NET_INCLUDES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/include
-)
-target_link_libraries(signal_splitter PRIVATE pn_discovery m)
+# Telemetry Logger - UDP telemetry listener and CSV logger (Windows + Linux)
+add_executable(telem_logger src/telem_logger.c)
+target_include_directories(telem_logger PRIVATE ${PHOENIX_NET_INCLUDES})
 if(WIN32)
-    target_link_libraries(signal_splitter PRIVATE ws2_32 iphlpapi)
+    target_link_libraries(telem_logger PRIVATE ws2_32 shell32)
 else()
-    target_link_libraries(signal_splitter PRIVATE pthread)
-endif()
-
-# SDR Controller - Send START/STOP commands to sdr_server (Windows + Linux)
-add_executable(sdr_controller src/sdr_controller.c)
-target_include_directories(sdr_controller PRIVATE 
-    ${PHOENIX_NET_INCLUDES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/phoenix-discovery/include
-)
-target_link_libraries(sdr_controller PRIVATE pn_discovery)
-if(WIN32)
-    target_link_libraries(sdr_controller PRIVATE ws2_32 iphlpapi)
-else()
-    target_link_libraries(sdr_controller PRIVATE pthread)
+    target_link_libraries(telem_logger PRIVATE pthread)
 endif()
 
 # Wormhole - 3D constellation mapper (DISABLED for now)
@@ -154,7 +134,7 @@ endif()
 # Install
 #============================================================================
 
-set(INSTALL_TARGETS sdr_server signal_splitter sdr_controller)
+set(INSTALL_TARGETS sdr_server telem_logger)
 if(NOT WIN32)
     list(APPEND INSTALL_TARGETS signal_relay)
 endif()
@@ -175,8 +155,7 @@ message(STATUS "  Platform:   ${CMAKE_SYSTEM_NAME}")
 message(STATUS "")
 message(STATUS "Targets:")
 message(STATUS "  - sdr_server      (TCP control + I/Q streaming)")
-message(STATUS "  - signal_splitter (split to detector/display paths)")
-message(STATUS "  - sdr_controller  (send START/STOP commands)")
+message(STATUS "  - telem_logger    (UDP telemetry listener and CSV logger)")
 if(NOT WIN32)
     message(STATUS "  - signal_relay    (Linux relay server)")
 endif()
