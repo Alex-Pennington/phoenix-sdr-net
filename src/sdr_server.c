@@ -142,9 +142,12 @@ static CRITICAL_SECTION g_iq_mutex;
 /* System tray globals */
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1001
+#define ID_TRAY_SHOW_CONSOLE 1002
 static HWND g_tray_hwnd = NULL;
+static HWND g_console_hwnd = NULL;
 static NOTIFYICONDATAA g_nid;
 static bool g_tray_active = false;
+static bool g_console_visible = true;
 #else
 static pthread_mutex_t g_iq_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -631,15 +634,41 @@ static void on_overload(bool overloaded, void *user_ctx) {
 static LRESULT CALLBACK tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_TRAYICON:
-            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
-                /* Show context menu */
+            if (lParam == WM_RBUTTONUP) {
+                /* Show context menu on right-click */
                 POINT pt;
                 GetCursorPos(&pt);
+                
                 HMENU menu = CreatePopupMenu();
-                AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit SDR Server");
-                SetForegroundWindow(hwnd);
-                TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-                DestroyMenu(menu);
+                if (menu) {
+                    /* Add show/hide console option */
+                    if (g_console_visible) {
+                        AppendMenuA(menu, MF_STRING, ID_TRAY_SHOW_CONSOLE, "Hide Console");
+                    } else {
+                        AppendMenuA(menu, MF_STRING, ID_TRAY_SHOW_CONSOLE, "Show Console");
+                    }
+                    
+                    /* Add exit option */
+                    AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit SDR Server");
+                    
+                    /* CRITICAL: SetForegroundWindow BEFORE TrackPopupMenu */
+                    SetForegroundWindow(hwnd);
+                    
+                    /* Show menu with proper flags */
+                    UINT uFlags = TPM_RIGHTBUTTON;
+                    if (GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0) {
+                        uFlags |= TPM_RIGHTALIGN;
+                    } else {
+                        uFlags |= TPM_LEFTALIGN;
+                    }
+                    
+                    TrackPopupMenuEx(menu, uFlags, pt.x, pt.y, hwnd, NULL);
+                    
+                    /* Required for proper menu cleanup */
+                    PostMessage(hwnd, WM_NULL, 0, 0);
+                    
+                    DestroyMenu(menu);
+                }
             }
             return 0;
 
@@ -647,6 +676,31 @@ static LRESULT CALLBACK tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (LOWORD(wParam) == ID_TRAY_EXIT) {
                 g_running = false;
                 PostQuitMessage(0);
+            } else if (LOWORD(wParam) == ID_TRAY_SHOW_CONSOLE) {
+                /* Toggle console window visibility */
+                if (!g_console_hwnd) {
+                    /* No console exists - allocate one */
+                    if (AllocConsole()) {
+                        g_console_hwnd = GetConsoleWindow();
+                        /* Redirect stdout/stderr to new console */
+                        freopen("CONOUT$", "w", stdout);
+                        freopen("CONOUT$", "w", stderr);
+                        g_console_visible = true;
+                        printf("Console allocated\n");
+                        printf("Phoenix SDR Server v%s\n", PHOENIX_VERSION_STRING);
+                        printf("Press Ctrl+C to stop or use tray icon\n");
+                    }
+                } else {
+                    /* Console exists - toggle visibility */
+                    if (g_console_visible) {
+                        ShowWindow(g_console_hwnd, SW_HIDE);
+                        g_console_visible = false;
+                    } else {
+                        ShowWindow(g_console_hwnd, SW_SHOW);
+                        SetForegroundWindow(g_console_hwnd);
+                        g_console_visible = true;
+                    }
+                }
             }
             return 0;
 
@@ -671,14 +725,16 @@ static bool init_tray_icon(void) {
         return false;
     }
 
-    /* Create hidden message window */
+    /* Create hidden window (not HWND_MESSAGE - those can't show popup menus) */
     g_tray_hwnd = CreateWindowA("PhoenixSDRTrayClass", "Phoenix SDR Server",
-                                 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
-                                 GetModuleHandle(NULL), NULL);
+                                 WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0, CW_USEDEFAULT, 0,
+                                 NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!g_tray_hwnd) {
         fprintf(stderr, "Failed to create tray window\n");
         return false;
     }
+    /* Keep window hidden */
+    ShowWindow(g_tray_hwnd, SW_HIDE);
 
     /* Set up notification icon data */
     memset(&g_nid, 0, sizeof(g_nid));
@@ -1149,23 +1205,58 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         freopen(log_filename, "a", stderr);  /* Append stderr to same file */
+        
+        /* Confirm logging is active */
+        printf("[INIT] Logging to %s\n", log_filename);
+        fflush(stdout);
     }
 
     /* Handle system tray / minimize mode */
-    if (g_start_minimized) {
 #ifdef _WIN32
-        /* Initialize system tray icon */
-        if (!init_tray_icon()) {
-            fprintf(stderr, "Warning: Failed to create system tray icon\n");
-        }
-
-        /* Hide the console window - tray icon is now visible */
-        HWND console = GetConsoleWindow();
-        if (console) {
-            ShowWindow(console, SW_HIDE);
-        }
-#endif
+    printf("[INIT] Starting tray initialization (minimized=%d)\n", g_start_minimized);
+    fflush(stdout);
+    
+    /* Get console window handle (may be NULL if launched without console) */
+    g_console_hwnd = GetConsoleWindow();
+    if (g_console_hwnd) {
+        printf("[INIT] Console window found (HWND=%p)\n", g_console_hwnd);
+    } else {
+        printf("[INIT] No console window (launched without console)\n");
     }
+    fflush(stdout);
+    
+    /* Initialize system tray icon */
+    if (!init_tray_icon()) {
+        fprintf(stderr, "Warning: Failed to create system tray icon\n");
+        fflush(stderr);
+    } else {
+        printf("[INIT] System tray icon created\n");
+        fflush(stdout);
+    }
+    
+    if (g_start_minimized) {
+        /* Hide the console window if it exists */
+        if (g_console_hwnd) {
+            ShowWindow(g_console_hwnd, SW_HIDE);
+            g_console_visible = false;
+            printf("[TRAY] Console hidden, tray icon active\n");
+        } else {
+            /* No console to hide (launched without console) */
+            g_console_visible = false;
+            printf("[TRAY] No console window to hide (already hidden by launcher)\n");
+        }
+    } else {
+        /* Console stays visible (or doesn't exist) */
+        if (g_console_hwnd) {
+            g_console_visible = true;
+            printf("[TRAY] Console visible, tray icon active\n");
+        } else {
+            g_console_visible = false;
+            printf("[TRAY] No console window (launched without console)\n");
+        }
+    }
+    fflush(stdout);
+#endif
 
     /* Initialize SDR state */
     tcp_state_defaults(&g_sdr_state);

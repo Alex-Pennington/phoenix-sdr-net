@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(phoenix-sdr-net
-    VERSION 0.1.3
+    VERSION 0.1.6
     DESCRIPTION "Phoenix SDR Network Tools"
     LANGUAGES C
 )
